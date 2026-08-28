@@ -44,7 +44,7 @@ $script:CachedStatusSnapshot = $null
 $script:StatusLogWriteCount = 0
 $script:LastArchivedStatusTime = [DateTime]::MinValue
 $script:StatusRetentionDays = 30
-$script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $true; ShowInternalQuota = $true }
+$script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $false; ShowInternalQuota = $true }
 $script:TimelineAges = @(18000.0, 3600.0, 1800.0, 900.0, 50.0, 40.0, 30.0, 20.0, 10.0, 0.0)
 $script:TimelineXs = @(0.0, 55.0, 105.0, 155.0, 218.0, 240.0, 262.0, 284.0, 307.0, 330.0)
 $script:ModelOrderPath = Join-Path $script:SettingsDirectory 'model-order.json'
@@ -52,6 +52,8 @@ $script:ModelOrder = [System.Collections.Generic.List[string]]::new()
 $script:DisplayedModels = @()
 $script:DragStartPoint = $null
 $script:DragModelId = $null
+$script:RefreshInProgress = $false
+$script:RefreshWorker = $null
 
 $legacyStateFiles = [ordered]@{
     '.lanz-session.bin' = $script:SessionPath
@@ -100,7 +102,7 @@ try {
     }
 }
 catch {
-    $script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $true; ShowInternalQuota = $true }
+    $script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $false; ShowInternalQuota = $true }
 }
 
 Add-Type -AssemblyName System.Security
@@ -220,6 +222,7 @@ function Get-LanZModels {
     $handler.CheckCertificateRevocationList = $false
     $handler.UseCookies = $false
     $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(8)
     $request = [System.Net.Http.HttpRequestMessage]::new(
         [System.Net.Http.HttpMethod]::Get,
         $script:Endpoint
@@ -314,6 +317,7 @@ function Get-LanZUsageOverview {
     $handler.CheckCertificateRevocationList = $false
     $handler.UseCookies = $false
     $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(8)
     $request = [System.Net.Http.HttpRequestMessage]::new(
         [System.Net.Http.HttpMethod]::Get,
         $script:UsageEndpoint
@@ -354,6 +358,7 @@ function Get-LanZAuthenticatedText {
     $handler.CheckCertificateRevocationList = $false
     $handler.UseCookies = $false
     $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(8)
     $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Uri)
     try {
         [void]$request.Headers.TryAddWithoutValidation('Cookie', "$($script:SessionCookieName)=$SessionValue")
@@ -1265,7 +1270,7 @@ function Export-LanZWindowScreenshot {
                     <StackPanel>
                         <TextBlock Text="显示与刷新" FontSize="11" FontWeight="SemiBold" Foreground="#314452" Margin="2,0,0,7"/>
                         <CheckBox x:Name="AutoRefreshToggle" Content="自动刷新（10 秒）" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
-                        <CheckBox x:Name="ShowExternalQuotaToggle" Content="显示外网模型额度" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
+                        <CheckBox x:Name="ShowExternalQuotaToggle" Content="显示外网模型额度" IsChecked="False" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
                         <CheckBox x:Name="ShowInternalQuotaToggle" Content="显示内网模型额度" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
                         <Separator Margin="0,7,0,7" Background="#E7ECEF"/>
                         <Button x:Name="LoginButton" Content="重新登录 / 切换凭据" Height="29" FontSize="11" Foreground="#5A47E5" Background="#F0EEFF" BorderBrush="#D9D3FF" Cursor="Hand"/>
@@ -1485,16 +1490,123 @@ function Show-LanZLogin {
     }
 }
 
-function Update-Widget {
+function Set-LanZRefreshError {
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
+    $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#F56C6C')
+    $updatedText.Text = $Exception.Message
+    $isUnauthorized = $Exception -is [System.UnauthorizedAccessException] -or $Exception.Message -match '会话已过期'
+    if ($isUnauthorized) {
+        $timer.Stop()
+        if (-not $script:SuppressAutoLogin) {
+            Show-LanZLogin
+        }
+    }
+}
+
+function Start-LanZRefresh {
+    if ($script:RefreshInProgress) {
+        return
+    }
+
     try {
         $sessionValue = Get-LanZSessionValue
-        $models = Get-LanZModels -SessionValue $sessionValue
-        $usageOverview = Get-LanZUsageOverview -SessionValue $sessionValue
-        $billingRules = Get-LanZBillingRules -SessionValue $sessionValue
+        $functionNames = @(
+            'New-LanZRequestToken',
+            'Get-LanZModels',
+            'Get-LanZUsageOverview',
+            'Get-LanZAuthenticatedText',
+            'Import-LanZBillingRulesCache',
+            'Get-LanZBillingRules'
+        )
+        $functionDefinitions = foreach ($functionName in $functionNames) {
+            $definition = (Get-Command -Name $functionName -CommandType Function -ErrorAction Stop).Definition
+            $definition = $definition -replace '\$script:', '$global:'
+            "function $functionName {`n$definition`n}`n"
+        }
+        $workerHeader = @'
+param(
+    [object]$Configuration,
+    [string]$SessionValue,
+    [string]$BillingRulesPath
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+[void](Add-Type -AssemblyName System.Net.Http)
+$global:Configuration = $Configuration
+$global:Endpoint = [string]$Configuration.ApiEndpoint
+$global:UsageEndpoint = [string]$Configuration.UsageEndpoint
+$global:UsageDashboardUrl = [string]$Configuration.UsageDashboardUrl
+$global:SessionCookieName = [string]$Configuration.SessionCookieName
+$global:BillingRulesPath = $BillingRulesPath
+$global:BillingRules = $null
+'@
+        $workerTail = @'
+$models = @(Get-LanZModels -SessionValue $SessionValue)
+$usageOverview = Get-LanZUsageOverview -SessionValue $SessionValue
+$billingRules = Get-LanZBillingRules -SessionValue $SessionValue
+[pscustomobject]@{
+    Models = $models
+    UsageOverview = $usageOverview
+    BillingRules = $billingRules
+}
+'@
+
+        $worker = [System.Management.Automation.PowerShell]::Create()
+        $workerScript =
+            $workerHeader +
+            [Environment]::NewLine +
+            ($functionDefinitions -join [Environment]::NewLine) +
+            [Environment]::NewLine +
+            $workerTail
+        [void]$worker.AddScript($workerScript)
+        [void]$worker.AddArgument($script:Configuration)
+        [void]$worker.AddArgument($sessionValue)
+        [void]$worker.AddArgument($script:BillingRulesPath)
+        $script:RefreshWorker = [pscustomobject]@{
+            PowerShell = $worker
+            Handle = $worker.BeginInvoke()
+        }
+        $script:RefreshInProgress = $true
+        $updatedText.Text = '正在刷新…'
+        $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
+        $refreshPollTimer.Start()
+    }
+    catch {
+        $script:RefreshInProgress = $false
+        if ($null -ne $script:RefreshWorker) {
+            $script:RefreshWorker.PowerShell.Dispose()
+            $script:RefreshWorker = $null
+        }
+        Set-LanZRefreshError -Exception $_.Exception
+    }
+    finally {
+        $sessionValue = $null
+    }
+}
+
+function Complete-LanZRefresh {
+    if ($null -eq $script:RefreshWorker -or -not $script:RefreshWorker.Handle.IsCompleted) {
+        return
+    }
+
+    $worker = $script:RefreshWorker
+    $script:RefreshWorker = $null
+    $script:RefreshInProgress = $false
+    $refreshPollTimer.Stop()
+    try {
+        $result = @($worker.PowerShell.EndInvoke($worker.Handle) | Select-Object -Last 1)[0]
+        if ($null -eq $result) {
+            throw '刷新没有返回可用数据。'
+        }
+        $models = @($result.Models)
+        $usageOverview = $result.UsageOverview
+        $script:BillingRules = $result.BillingRules
         $modelsWithHistory = @(Add-LanZChartHistory -Models $models)
         $script:DisplayedModels = @(Sort-LanZModels -Models $modelsWithHistory)
         $modelsList.ItemsSource = $script:DisplayedModels
-        $usageCard.DataContext = New-LanZQuotaViewModel -Overview $usageOverview -BillingRules $billingRules
+        $usageCard.DataContext = New-LanZQuotaViewModel -Overview $usageOverview -BillingRules $script:BillingRules
         try {
             Save-LanZStatusSnapshot -Models $models -Overview $usageOverview
         }
@@ -1505,18 +1617,15 @@ function Update-Widget {
         $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
     }
     catch {
-        $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#F56C6C')
-        $updatedText.Text = $_.Exception.Message
-        if ($_.Exception -is [System.UnauthorizedAccessException]) {
-            $timer.Stop()
-            if (-not $script:SuppressAutoLogin) {
-                Show-LanZLogin
-            }
-        }
+        Set-LanZRefreshError -Exception $_.Exception
     }
     finally {
-        $sessionValue = $null
+        $worker.PowerShell.Dispose()
     }
+}
+
+function Update-Widget {
+    Start-LanZRefresh
 }
 
 function Show-LanZCachedStatus {
@@ -1584,6 +1693,9 @@ function Save-LanZUiPreferences {
 $timer = [Windows.Threading.DispatcherTimer]::new()
 $timer.Interval = [TimeSpan]::FromSeconds($RefreshSeconds)
 $timer.Add_Tick({ Update-Widget })
+$refreshPollTimer = [Windows.Threading.DispatcherTimer]::new()
+$refreshPollTimer.Interval = [TimeSpan]::FromMilliseconds(120)
+$refreshPollTimer.Add_Tick({ Complete-LanZRefresh })
 $startupTimer = [Windows.Threading.DispatcherTimer]::new()
 $startupTimer.Interval = [TimeSpan]::FromMilliseconds(80)
 $startupTimer.Add_Tick({
@@ -1740,9 +1852,13 @@ $window.Add_Loaded({
         if (-not [string]::IsNullOrWhiteSpace($SettingsScreenshotPath)) {
             $settingsButton.IsChecked = $true
         }
+        $screenshotDeadline = [DateTime]::UtcNow.AddSeconds(10)
         $screenshotTimer = [Windows.Threading.DispatcherTimer]::new()
         $screenshotTimer.Interval = [TimeSpan]::FromMilliseconds(500)
         $screenshotTimer.Add_Tick({
+            if ($script:RefreshInProgress -and [DateTime]::UtcNow -lt $screenshotDeadline) {
+                return
+            }
             $screenshotTimer.Stop()
             if (-not [string]::IsNullOrWhiteSpace($ScreenshotPath)) {
                 Export-LanZWindowScreenshot -TargetWindow $window -Path $ScreenshotPath
@@ -1757,7 +1873,22 @@ $window.Add_Loaded({
     }
     $startupTimer.Start()
 })
-$window.Add_Closed({ $startupTimer.Stop(); $timer.Stop() })
+$window.Add_Closed({
+    $startupTimer.Stop()
+    $timer.Stop()
+    $refreshPollTimer.Stop()
+    if ($null -ne $script:RefreshWorker) {
+        try {
+            $script:RefreshWorker.PowerShell.Stop()
+        }
+        catch {
+            # The process is closing; the background refresh can be abandoned.
+        }
+        $script:RefreshWorker.PowerShell.Dispose()
+        $script:RefreshWorker = $null
+        $script:RefreshInProgress = $false
+    }
+})
 
 [void]$window.ShowDialog()
 }
