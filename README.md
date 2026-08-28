@@ -29,6 +29,18 @@
 
 ## 首次使用
 
+### Windows EXE 版
+
+1. 从 GitHub Releases 下载 `LanZ-Monitor-win-x64.zip` 并解压。
+2. 先运行 `LanZ-Setup.exe`，完成连接参数和会话值的本地加密配置。
+3. 运行 `LanZ-Monitor.exe`。之后可从齿轮菜单选择“重新登录”，无需重新输入连接参数。
+
+EXE 版不需要另外安装 PowerShell 7，但仍需要 Windows 10/11 自带的 Windows PowerShell 5.1 与 Microsoft Edge WebView2 Runtime。WebView2 SDK 依赖会由主程序自动释放到 `%LOCALAPPDATA%\LanZ-Monitor\runtime\WebView2`。发布包不包含服务地址、Cookie、Token、密钥或密码；这些内容只会在首次配置时写入当前用户的 DPAPI 加密文件。
+
+GitHub 发布的 EXE 目前未使用商业代码签名证书签名，Windows 可能在首次启动时显示 SmartScreen 提示。可对照 Release 页面的 SHA-256 校验值确认文件完整性。
+
+### 源码版
+
 1. 下载或克隆仓库。
 2. 双击 `setup-session.cmd`。
 3. 根据提示填写模型状态 API、当日请求用量 API、资源看板页面、网页登录地址、Cookie 名称、请求令牌参数和接口状态代码。
