@@ -1,6 +1,7 @@
 .lanz-session*
 .lanz-config*
 .lanz-model-order.json
+.lanz-history.json
 .lanz-token-raw
 .analysis-app.js
 .tmp-webview2*

@@ -1,5 +1,6 @@
 param(
     [switch]$Once,
+    [string]$ScreenshotPath,
     [ValidateRange(2, 60)]
     [int]$RefreshSeconds = 10
 )
@@ -13,6 +14,9 @@ $script:ConfigPath = Join-Path $script:AppDirectory '.lanz-config.bin'
 $script:LoginWindowOpen = $false
 $script:SuppressAutoLogin = $false
 $script:LoadHistory = @{}
+$script:HistoryPath = Join-Path $script:AppDirectory '.lanz-history.json'
+$script:TimelineAges = @(18000.0, 3600.0, 1800.0, 900.0, 50.0, 40.0, 30.0, 20.0, 10.0, 0.0)
+$script:TimelineXs = @(0.0, 55.0, 105.0, 155.0, 218.0, 240.0, 262.0, 284.0, 307.0, 330.0)
 $script:ModelOrderPath = Join-Path $script:AppDirectory '.lanz-model-order.json'
 $script:ModelOrder = [System.Collections.Generic.List[string]]::new()
 $script:DisplayedModels = @()
@@ -243,22 +247,104 @@ try {
     Add-Type -AssemblyName PresentationCore
     Add-Type -AssemblyName WindowsBase
 
+function Initialize-LanZHistory {
+    if (-not (Test-Path -LiteralPath $script:HistoryPath)) {
+        return
+    }
+
+    try {
+        $payload = Get-Content -LiteralPath $script:HistoryPath -Raw | ConvertFrom-Json
+        $cutoff = [DateTime]::UtcNow.AddHours(-5)
+        foreach ($property in $payload.PSObject.Properties) {
+            $history = [System.Collections.Generic.List[object]]::new()
+            foreach ($sample in @($property.Value)) {
+                $timestamp = if ($sample.Timestamp -is [DateTime]) {
+                    $sample.Timestamp.ToUniversalTime()
+                }
+                else {
+                    [DateTime]::Parse(
+                        [string]$sample.Timestamp,
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [Globalization.DateTimeStyles]::RoundtripKind
+                    ).ToUniversalTime()
+                }
+                if ($timestamp -ge $cutoff) {
+                    $history.Add([pscustomobject]@{
+                        Timestamp = $timestamp
+                        Percent = [int]$sample.Percent
+                    })
+                }
+            }
+            if ($history.Count -gt 0) {
+                $script:LoadHistory[[string]$property.Name] = $history
+            }
+        }
+    }
+    catch {
+        $script:LoadHistory = @{}
+    }
+}
+
+function Save-LanZHistory {
+    $payload = [ordered]@{}
+    foreach ($key in @($script:LoadHistory.Keys)) {
+        $payload[$key] = @($script:LoadHistory[$key] | ForEach-Object {
+            [ordered]@{
+                Timestamp = $_.Timestamp.ToUniversalTime().ToString('o')
+                Percent = [int]$_.Percent
+            }
+        })
+    }
+    [System.IO.File]::WriteAllText(
+        $script:HistoryPath,
+        ($payload | ConvertTo-Json -Depth 5 -Compress),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+
+function Get-LanZTimelineX {
+    param([Parameter(Mandatory)][double]$AgeSeconds)
+
+    if ($AgeSeconds -ge $script:TimelineAges[0]) {
+        return $script:TimelineXs[0]
+    }
+    if ($AgeSeconds -le 0) {
+        return $script:TimelineXs[$script:TimelineXs.Count - 1]
+    }
+
+    for ($index = 0; $index -lt ($script:TimelineAges.Count - 1); $index++) {
+        $olderAge = $script:TimelineAges[$index]
+        $newerAge = $script:TimelineAges[$index + 1]
+        if ($AgeSeconds -le $olderAge -and $AgeSeconds -ge $newerAge) {
+            $progress = ($olderAge - $AgeSeconds) / ($olderAge - $newerAge)
+            return $script:TimelineXs[$index] + ($progress * ($script:TimelineXs[$index + 1] - $script:TimelineXs[$index]))
+        }
+    }
+    return 330.0
+}
+
 function Add-LanZChartHistory {
     param([Parameter(Mandatory)][array]$Models)
 
+    $now = [DateTime]::UtcNow
+    $cutoff = $now.AddHours(-5)
     foreach ($model in $Models) {
         $key = [string]$model.ModelId
         if (-not $script:LoadHistory.ContainsKey($key)) {
-            $script:LoadHistory[$key] = [System.Collections.Generic.List[int]]::new()
+            $script:LoadHistory[$key] = [System.Collections.Generic.List[object]]::new()
         }
 
         $history = $script:LoadHistory[$key]
-        $history.Add([int]$model.Percent)
-        while ($history.Count -gt 30) {
+        $history.Add([pscustomobject]@{
+            Timestamp = $now
+            Percent = [int]$model.Percent
+        })
+        while ($history.Count -gt 0 -and $history[0].Timestamp -lt $cutoff) {
             $history.RemoveAt(0)
         }
 
-        $values = @($history)
+        $samples = @($history | Sort-Object Timestamp)
+        $values = @($samples | ForEach-Object { [int]$_.Percent })
         $minimum = [int](($values | Measure-Object -Minimum).Minimum)
         $maximum = [int](($values | Measure-Object -Maximum).Maximum)
         $lower = [math]::Max(0, $minimum - 2)
@@ -279,27 +365,64 @@ function Add-LanZChartHistory {
         }
 
         $range = [math]::Max(1, $upper - $lower)
-        $chartWidth = 330.0
-        $chartHeight = 28.0
-        $points = [Windows.Media.PointCollection]::new()
-        for ($index = 0; $index -lt $values.Count; $index++) {
-            $x = if ($values.Count -le 1) { 0.0 } else { $index * $chartWidth / ($values.Count - 1) }
-            $y = $chartHeight - (([double]$values[$index] - $lower) / $range * $chartHeight)
-            [void]$points.Add([Windows.Point]::new($x, $y))
-        }
-        if ($values.Count -eq 1) {
-            [void]$points.Add([Windows.Point]::new($chartWidth, $points[0].Y))
+        $plotHeight = 25.0
+        $geometry = [Windows.Media.PathGeometry]::new()
+        $previousTimestamp = $null
+        $firstPoint = $null
+        $lastPoint = $null
+        foreach ($sample in $samples) {
+            $ageSeconds = [math]::Max(0, ($now - $sample.Timestamp).TotalSeconds)
+            $x = Get-LanZTimelineX -AgeSeconds $ageSeconds
+            $y = $plotHeight - (([double]$sample.Percent - $lower) / $range * $plotHeight)
+            $point = [Windows.Point]::new($x, $y)
+            if ($null -eq $firstPoint) {
+                $firstPoint = $point
+            }
+
+            if ($null -eq $previousTimestamp -or ($sample.Timestamp - $previousTimestamp).TotalSeconds -gt 30) {
+                $figure = [Windows.Media.PathFigure]::new()
+                $figure.StartPoint = $point
+                $figure.IsClosed = $false
+                $figure.IsFilled = $false
+                $geometry.Figures.Add($figure)
+            }
+            else {
+                $figure.Segments.Add([Windows.Media.LineSegment]::new($point, $true))
+            }
+            $previousTimestamp = $sample.Timestamp
+            $lastPoint = $point
         }
 
-        $lastPoint = $points[$points.Count - 1]
-        $model | Add-Member -NotePropertyName ChartPoints -NotePropertyValue $points -Force
-        $model | Add-Member -NotePropertyName ChartRange -NotePropertyValue ("纵轴 $lower–$upper%") -Force
+        $backfillPoints = [Windows.Media.PointCollection]::new()
+        if ($null -ne $firstPoint -and $firstPoint.X -gt 0.5) {
+            [void]$backfillPoints.Add([Windows.Point]::new(0, $firstPoint.Y))
+            [void]$backfillPoints.Add($firstPoint)
+        }
+
+        $model | Add-Member -NotePropertyName ChartGeometry -NotePropertyValue $geometry -Force
+        $model | Add-Member -NotePropertyName BackfillPoints -NotePropertyValue $backfillPoints -Force
+        $model | Add-Member -NotePropertyName ChartUpperLabel -NotePropertyValue ("$upper%") -Force
+        $model | Add-Member -NotePropertyName ChartLowerLabel -NotePropertyValue ("$lower%") -Force
         $model | Add-Member -NotePropertyName CurrentX -NotePropertyValue ([math]::Max(0, $lastPoint.X - 3)) -Force
         $model | Add-Member -NotePropertyName CurrentY -NotePropertyValue ([math]::Max(0, $lastPoint.Y - 3)) -Force
+        $model | Add-Member -NotePropertyName CurrentMargin -NotePropertyValue ([Windows.Thickness]::new(
+            [math]::Max(0, $lastPoint.X - 3),
+            [math]::Max(0, $lastPoint.Y - 3),
+            0,
+            0
+        )) -Force
     }
 
+    try {
+        Save-LanZHistory
+    }
+    catch {
+        # History persistence is optional; a write failure must not stop live monitoring.
+    }
     return $Models
 }
+
+Initialize-LanZHistory
 
 function Save-LanZModelOrder {
     $json = ConvertTo-Json -InputObject @($script:ModelOrder) -Compress
@@ -351,11 +474,44 @@ function Get-LanZModelFromVisual {
     return $null
 }
 
+function Export-LanZWindowScreenshot {
+    param(
+        [Parameter(Mandatory)][Windows.Window]$TargetWindow,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $TargetWindow.UpdateLayout()
+    $width = [math]::Max(1, [int][math]::Ceiling($TargetWindow.ActualWidth))
+    $height = [math]::Max(1, [int][math]::Ceiling($TargetWindow.ActualHeight))
+    $bitmap = [Windows.Media.Imaging.RenderTargetBitmap]::new(
+        $width,
+        $height,
+        96,
+        96,
+        [Windows.Media.PixelFormats]::Pbgra32
+    )
+    $bitmap.Render($TargetWindow)
+    $encoder = [Windows.Media.Imaging.PngBitmapEncoder]::new()
+    $encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bitmap))
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $parentDirectory = [System.IO.Path]::GetDirectoryName($fullPath)
+    if (-not [string]::IsNullOrWhiteSpace($parentDirectory)) {
+        [System.IO.Directory]::CreateDirectory($parentDirectory) | Out-Null
+    }
+    $stream = [System.IO.File]::Create($fullPath)
+    try {
+        $encoder.Save($stream)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="LanZ 负载监控"
-        Width="410" Height="382"
+        Width="410" Height="420"
         WindowStyle="None" ResizeMode="NoResize"
         AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="True"
@@ -426,7 +582,7 @@ function Get-LanZModelFromVisual {
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="20"/>
                                     <RowDefinition Height="19"/>
-                                    <RowDefinition Height="34"/>
+                                    <RowDefinition Height="46"/>
                                 </Grid.RowDefinitions>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
@@ -438,14 +594,36 @@ function Get-LanZModelFromVisual {
                                 </StackPanel>
                                 <TextBlock Grid.Column="1" Text="{Binding Summary}" FontSize="12" Foreground="#61727E"/>
                                 <TextBlock Grid.Row="1" Grid.ColumnSpan="2" Text="{Binding ModelId}" FontSize="11" FontWeight="Normal" Foreground="#87949E" TextTrimming="CharacterEllipsis"/>
-                                <Grid Grid.Row="2" Grid.ColumnSpan="2" Height="32" ClipToBounds="True">
+                                <Grid Grid.Row="2" Grid.ColumnSpan="2" Height="44" ClipToBounds="True">
                                     <Border Background="#F4F7F9" CornerRadius="5"/>
-                                    <Canvas Width="330" Height="28" HorizontalAlignment="Left" VerticalAlignment="Center" ClipToBounds="True">
-                                        <Line X1="0" Y1="14" X2="330" Y2="14" Stroke="#DFE6EB" StrokeThickness="1" StrokeDashArray="3,3"/>
-                                        <Polyline Points="{Binding ChartPoints}" Stroke="{Binding Color}" StrokeThickness="2.2" StrokeLineJoin="Round"/>
-                                        <Ellipse Width="6" Height="6" Fill="{Binding Color}" Canvas.Left="{Binding CurrentX}" Canvas.Top="{Binding CurrentY}"/>
+                                    <Canvas Width="330" Height="42" HorizontalAlignment="Left" VerticalAlignment="Center" ClipToBounds="True">
+                                        <Line X1="0" Y1="27" X2="330" Y2="27" Stroke="#D8E1E7" StrokeThickness="1"/>
+                                        <Line X1="0" Y1="27" X2="0" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="55" Y1="27" X2="55" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="105" Y1="27" X2="105" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="155" Y1="27" X2="155" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="218" Y1="27" X2="218" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="240" Y1="27" X2="240" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="262" Y1="27" X2="262" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="284" Y1="27" X2="284" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="307" Y1="27" X2="307" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="329" Y1="27" X2="329" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <TextBlock Text="5h" Canvas.Left="0" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
+                                        <TextBlock Text="1h" Canvas.Left="49" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
+                                        <TextBlock Text="30m" Canvas.Left="94" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
+                                        <TextBlock Text="15m" Canvas.Left="145" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
+                                        <TextBlock Text="50s" Canvas.Left="209" Canvas.Top="30" FontSize="7.5" Foreground="#87959F"/>
+                                        <TextBlock Text="40" Canvas.Left="235" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="30" Canvas.Left="257" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="20" Canvas.Left="279" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="10" Canvas.Left="302" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="0" Canvas.Left="324" Canvas.Top="30" FontSize="7.5" Foreground="#87959F"/>
+                                        <Polyline Points="{Binding BackfillPoints}" Stroke="{Binding Color}" StrokeThickness="1.6" StrokeDashArray="3,3" Opacity="0.3"/>
+                                        <Path Data="{Binding ChartGeometry}" Stroke="{Binding Color}" StrokeThickness="2.2" StrokeLineJoin="Round" Fill="Transparent"/>
                                     </Canvas>
-                                    <TextBlock Text="{Binding ChartRange}" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,2,5,0" Padding="3,0" FontSize="9" Foreground="#84939E" Background="#DDF4F7F9"/>
+                                    <Ellipse Width="6" Height="6" Fill="{Binding Color}" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="{Binding CurrentMargin}" IsHitTestVisible="False"/>
+                                    <TextBlock Text="{Binding ChartUpperLabel}" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,1,4,0" Padding="2,0" FontSize="8" Foreground="#84939E" Background="#CCF4F7F9"/>
+                                    <TextBlock Text="{Binding ChartLowerLabel}" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,18,4,0" Padding="2,0" FontSize="8" Foreground="#84939E" Background="#CCF4F7F9"/>
                                 </Grid>
                             </Grid>
                         </Border>
@@ -797,6 +975,17 @@ $window.Add_PreviewMouseLeftButtonDown({
 })
 $window.Add_Loaded({
     Update-Widget
+    if (-not [string]::IsNullOrWhiteSpace($ScreenshotPath)) {
+        $screenshotTimer = [Windows.Threading.DispatcherTimer]::new()
+        $screenshotTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+        $screenshotTimer.Add_Tick({
+            $screenshotTimer.Stop()
+            Export-LanZWindowScreenshot -TargetWindow $window -Path $ScreenshotPath
+            $window.Close()
+        }.GetNewClosure())
+        $screenshotTimer.Start()
+        return
+    }
     if ($autoRefreshToggle.IsChecked -and -not $script:LoginWindowOpen) {
         $timer.Start()
     }
