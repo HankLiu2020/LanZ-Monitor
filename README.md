@@ -12,7 +12,7 @@
 - 显示当日请求数，以及内网、外网模型额度的使用百分比和余量。
 - 从资源看板动态解析积分免费/计费规则，显示当前状态与下一次切换时间。
 - 自适应纵轴折线图会放大近期波动区间，并保留最近 5 小时的本地采样。
-- 轻量 JSONL 日志保存最近状态，重启后先恢复上次画面，再更新实时数据。
+- 轻量 JSONL 日志跨天保留 30 天负载状态，重启后先恢复上次画面，再更新实时数据。
 - 绿、橙、红三档负载底色。
 - 模型卡片可拖动排序，并在本机保存顺序。
 - 大头钉可开启或取消窗口置顶。
@@ -35,10 +35,10 @@
 4. 输入当前会话值。敏感输入不会显示在终端中。
 5. 双击 `start-widget.cmd`。
 
-配置保存在 `.lanz-config.bin`，会话值保存在 `.lanz-session.bin`。二者均经过当前 Windows 用户范围的 DPAPI 加密，并已被 `.gitignore` 排除。需要修改连接参数时可执行：
+所有运行数据都位于 `%LOCALAPPDATA%\LanZ-Monitor`，不再与程序代码混放。配置与会话值分别保存在 `secrets\connection.bin` 和 `secrets\session.bin`，二者均经过当前 Windows 用户范围的 DPAPI 加密。旧版本的 `.lanz-*` 数据会在首次启动时自动迁移。需要修改连接参数时可执行：
 
 ```powershell
-pwsh -NoProfile -File .\Set-LanZSession.ps1 -Reconfigure
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Set-LanZSession.ps1 -Reconfigure
 ```
 
 也可以临时设置环境变量 `LANZ_SESSION_VALUE` 来覆盖本地加密会话值。
@@ -54,8 +54,10 @@ pwsh -NoProfile -File .\Set-LanZSession.ps1 -Reconfigure
 - 负载低于 60% 显示绿色，60%–84% 显示橙色，85% 及以上显示红色。
 - 按住模型卡片上下拖动可改变顺序。
 - 右上角大头钉亮起时窗口保持置顶。
-- 齿轮菜单中的显示选择和自动刷新状态会保存在本机 `.lanz-ui.json`。
-- 最近 5 小时负载采样保存在 `.lanz-history.json`，最近完整状态保存在 `.lanz-status.jsonl`；两者只存在本机且均不入库。
+- 齿轮菜单中的显示选择和自动刷新状态会保存在本机 `settings\ui.json`。
+- `data\chart-history.json` 保存折线图所需的最近 5 小时高频采样。
+- `data\latest-status.json` 每 10 秒更新，用于重启后立即恢复最后画面。
+- `data\load-history.jsonl` 每分钟归档一条，跨天保留 30 天，最多 50,000 条，防止日志无限增长。
 
 ## 安全设计
 
@@ -63,7 +65,7 @@ pwsh -NoProfile -File .\Set-LanZSession.ps1 -Reconfigure
 - 程序不会读取网页登录密码，只读取配置指定域名在登录完成后设置的会话 Cookie。
 - WebView2 使用独立的持久化用户数据目录，不直接读取桌面版 Edge 的密码库。
 - 自动填充和密码保存由 WebView2 Runtime 管理。
-- 动态规则缓存、界面偏好、负载历史和状态日志都已被 `.gitignore` 排除。
+- 凭据、动态规则缓存、界面偏好、负载历史和状态日志均位于用户的 `%LOCALAPPDATA%` 目录，不会进入 Git 仓库。
 
 ## 数据格式
 

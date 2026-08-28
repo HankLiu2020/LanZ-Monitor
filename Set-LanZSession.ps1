@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Reconfigure
 )
 
@@ -7,9 +7,36 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Security
 
-$appDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
-$configPath = Join-Path $appDirectory '.lanz-config.bin'
-$sessionPath = Join-Path $appDirectory '.lanz-session.bin'
+$scriptRootValue = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    $PSScriptRoot
+}
+else {
+    Get-Variable -Name ScriptRoot -ValueOnly -ErrorAction SilentlyContinue
+}
+$appDirectory = if (-not [string]::IsNullOrWhiteSpace([string]$scriptRootValue)) {
+    [string]$scriptRootValue
+}
+else {
+    Split-Path -Parent ([Environment]::GetCommandLineArgs()[0])
+}
+$stateRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'LanZ-Monitor'
+$secretsDirectory = Join-Path $stateRoot 'secrets'
+[void][IO.Directory]::CreateDirectory($secretsDirectory)
+$configPath = Join-Path $secretsDirectory 'connection.bin'
+$sessionPath = Join-Path $secretsDirectory 'session.bin'
+foreach ($legacyPair in @(
+    @{ Old = (Join-Path $appDirectory '.lanz-config.bin'); New = $configPath },
+    @{ Old = (Join-Path $appDirectory '.lanz-session.bin'); New = $sessionPath }
+)) {
+    if ((Test-Path -LiteralPath $legacyPair.Old) -and -not (Test-Path -LiteralPath $legacyPair.New)) {
+        try {
+            [IO.File]::Move($legacyPair.Old, $legacyPair.New)
+        }
+        catch {
+            [IO.File]::Copy($legacyPair.Old, $legacyPair.New, $false)
+        }
+    }
+}
 $requestTokenKey = $null
 $requestTokenIV = $null
 

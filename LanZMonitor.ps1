@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Once,
     [string]$ScreenshotPath,
     [string]$SettingsScreenshotPath,
@@ -9,27 +9,72 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:AppDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:SessionPath = Join-Path $script:AppDirectory '.lanz-session.bin'
-$script:ConfigPath = Join-Path $script:AppDirectory '.lanz-config.bin'
+$scriptRootValue = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    $PSScriptRoot
+}
+else {
+    Get-Variable -Name ScriptRoot -ValueOnly -ErrorAction SilentlyContinue
+}
+$script:AppDirectory = if (-not [string]::IsNullOrWhiteSpace([string]$scriptRootValue)) {
+    [string]$scriptRootValue
+}
+else {
+    Split-Path -Parent ([Environment]::GetCommandLineArgs()[0])
+}
+$script:StateRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'LanZ-Monitor'
+$script:SecretsDirectory = Join-Path $script:StateRoot 'secrets'
+$script:DataDirectory = Join-Path $script:StateRoot 'data'
+$script:SettingsDirectory = Join-Path $script:StateRoot 'settings'
+$script:RuntimeDirectory = Join-Path $script:StateRoot 'runtime'
+foreach ($directory in @($script:SecretsDirectory, $script:DataDirectory, $script:SettingsDirectory, $script:RuntimeDirectory)) {
+    [void][IO.Directory]::CreateDirectory($directory)
+}
+$script:SessionPath = Join-Path $script:SecretsDirectory 'session.bin'
+$script:ConfigPath = Join-Path $script:SecretsDirectory 'connection.bin'
 $script:LoginWindowOpen = $false
 $script:SuppressAutoLogin = $false
 $script:LoadHistory = @{}
-$script:HistoryPath = Join-Path $script:AppDirectory '.lanz-history.json'
-$script:UiPreferencesPath = Join-Path $script:AppDirectory '.lanz-ui.json'
-$script:BillingRulesPath = Join-Path $script:AppDirectory '.lanz-billing-rules.json'
-$script:StatusLogPath = Join-Path $script:AppDirectory '.lanz-status.jsonl'
+$script:HistoryPath = Join-Path $script:DataDirectory 'chart-history.json'
+$script:LatestStatusPath = Join-Path $script:DataDirectory 'latest-status.json'
+$script:StatusLogPath = Join-Path $script:DataDirectory 'load-history.jsonl'
+$script:UiPreferencesPath = Join-Path $script:SettingsDirectory 'ui.json'
+$script:BillingRulesPath = Join-Path $script:SettingsDirectory 'billing-rules.json'
 $script:BillingRules = $null
 $script:CachedStatusSnapshot = $null
 $script:StatusLogWriteCount = 0
+$script:LastArchivedStatusTime = [DateTime]::MinValue
+$script:StatusRetentionDays = 30
 $script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $true; ShowInternalQuota = $true }
 $script:TimelineAges = @(18000.0, 3600.0, 1800.0, 900.0, 50.0, 40.0, 30.0, 20.0, 10.0, 0.0)
 $script:TimelineXs = @(0.0, 55.0, 105.0, 155.0, 218.0, 240.0, 262.0, 284.0, 307.0, 330.0)
-$script:ModelOrderPath = Join-Path $script:AppDirectory '.lanz-model-order.json'
+$script:ModelOrderPath = Join-Path $script:SettingsDirectory 'model-order.json'
 $script:ModelOrder = [System.Collections.Generic.List[string]]::new()
 $script:DisplayedModels = @()
 $script:DragStartPoint = $null
 $script:DragModelId = $null
+
+$legacyStateFiles = [ordered]@{
+    '.lanz-session.bin' = $script:SessionPath
+    '.lanz-config.bin' = $script:ConfigPath
+    '.lanz-history.json' = $script:HistoryPath
+    '.lanz-status.jsonl' = $script:StatusLogPath
+    '.lanz-ui.json' = $script:UiPreferencesPath
+    '.lanz-billing-rules.json' = $script:BillingRulesPath
+    '.lanz-model-order.json' = $script:ModelOrderPath
+}
+foreach ($legacyName in $legacyStateFiles.Keys) {
+    $legacyPath = Join-Path $script:AppDirectory $legacyName
+    $newPath = [string]$legacyStateFiles[$legacyName]
+    if ((Test-Path -LiteralPath $legacyPath) -and -not (Test-Path -LiteralPath $newPath)) {
+        try {
+            [IO.File]::Move($legacyPath, $newPath)
+        }
+        catch {
+            # A read-only install directory must not prevent the application from using new storage.
+            [IO.File]::Copy($legacyPath, $newPath, $false)
+        }
+    }
+}
 
 try {
     if (Test-Path -LiteralPath $script:ModelOrderPath) {
@@ -173,6 +218,7 @@ function Get-LanZModels {
     }
     $handler = [System.Net.Http.HttpClientHandler]::new()
     $handler.CheckCertificateRevocationList = $false
+    $handler.UseCookies = $false
     $client = [System.Net.Http.HttpClient]::new($handler)
     $request = [System.Net.Http.HttpRequestMessage]::new(
         [System.Net.Http.HttpMethod]::Get,
@@ -266,6 +312,7 @@ function Get-LanZUsageOverview {
     }
     $handler = [System.Net.Http.HttpClientHandler]::new()
     $handler.CheckCertificateRevocationList = $false
+    $handler.UseCookies = $false
     $client = [System.Net.Http.HttpClient]::new($handler)
     $request = [System.Net.Http.HttpRequestMessage]::new(
         [System.Net.Http.HttpMethod]::Get,
@@ -305,6 +352,7 @@ function Get-LanZAuthenticatedText {
 
     $handler = [System.Net.Http.HttpClientHandler]::new()
     $handler.CheckCertificateRevocationList = $false
+    $handler.UseCookies = $false
     $client = [System.Net.Http.HttpClient]::new($handler)
     $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Uri)
     try {
@@ -674,15 +722,28 @@ function Initialize-LanZHistory {
 }
 
 function Initialize-LanZStatusSnapshot {
-    if (-not (Test-Path -LiteralPath $script:StatusLogPath)) {
-        return
-    }
     try {
-        $lastLine = [IO.File]::ReadLines($script:StatusLogPath) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            Select-Object -Last 1
+        if (Test-Path -LiteralPath $script:LatestStatusPath) {
+            $script:CachedStatusSnapshot = Get-Content -LiteralPath $script:LatestStatusPath -Raw | ConvertFrom-Json
+        }
+        $lastLine = if (Test-Path -LiteralPath $script:StatusLogPath) {
+            [IO.File]::ReadLines($script:StatusLogPath) |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Select-Object -Last 1
+        }
+        else {
+            $null
+        }
         if (-not [string]::IsNullOrWhiteSpace($lastLine)) {
-            $script:CachedStatusSnapshot = $lastLine | ConvertFrom-Json
+            $lastArchived = $lastLine | ConvertFrom-Json
+            $script:LastArchivedStatusTime = [DateTime]::Parse(
+                [string]$lastArchived.Timestamp,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            ).ToUniversalTime()
+            if ($null -eq $script:CachedStatusSnapshot) {
+                $script:CachedStatusSnapshot = $lastArchived
+            }
         }
     }
     catch {
@@ -720,18 +781,34 @@ function Save-LanZStatusSnapshot {
             internalDailyLimit = [int]$Overview.internalDailyLimit
         }
     }
-    $line = ($snapshot | ConvertTo-Json -Depth 6 -Compress) + [Environment]::NewLine
-    [IO.File]::AppendAllText($script:StatusLogPath, $line, [Text.UTF8Encoding]::new($false))
-    $script:CachedStatusSnapshot = $line.TrimEnd() | ConvertFrom-Json
+    $snapshotJson = $snapshot | ConvertTo-Json -Depth 6 -Compress
+    [IO.File]::WriteAllText($script:LatestStatusPath, $snapshotJson, [Text.UTF8Encoding]::new($false))
+    $script:CachedStatusSnapshot = $snapshotJson | ConvertFrom-Json
+
+    $snapshotTime = [DateTime]::Parse(
+        [string]$snapshot.Timestamp,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind
+    ).ToUniversalTime()
+    if (($snapshotTime - $script:LastArchivedStatusTime).TotalSeconds -lt 60) {
+        return
+    }
+
+    [IO.File]::AppendAllText(
+        $script:StatusLogPath,
+        $snapshotJson + [Environment]::NewLine,
+        [Text.UTF8Encoding]::new($false)
+    )
+    $script:LastArchivedStatusTime = $snapshotTime
     $script:StatusLogWriteCount++
 
     $logSize = (Get-Item -LiteralPath $script:StatusLogPath).Length
-    if ($script:StatusLogWriteCount % 60 -ne 0 -and $logSize -lt 2MB) {
+    if ($script:StatusLogWriteCount % 60 -ne 0 -and $logSize -lt 32MB) {
         return
     }
 
     try {
-        $cutoff = [DateTime]::UtcNow.AddHours(-5)
+        $cutoff = [DateTime]::UtcNow.AddDays(-$script:StatusRetentionDays)
         $retained = [System.Collections.Generic.List[string]]::new()
         foreach ($existingLine in [IO.File]::ReadLines($script:StatusLogPath)) {
             if ([string]::IsNullOrWhiteSpace($existingLine)) {
@@ -752,8 +829,8 @@ function Save-LanZStatusSnapshot {
                 # Ignore a partial/corrupt log line; later valid samples remain usable.
             }
         }
-        if ($retained.Count -gt 2000) {
-            $lastLines = @($retained | Select-Object -Last 2000)
+        if ($retained.Count -gt 50000) {
+            $lastLines = @($retained | Select-Object -Last 50000)
             $retained.Clear()
             foreach ($lastLine in $lastLines) {
                 $retained.Add($lastLine)
@@ -1237,10 +1314,19 @@ function Show-LanZLogin {
     $timer.Stop()
 
     try {
-        $webViewDirectory = Join-Path $script:AppDirectory 'lib\WebView2'
+        $webViewDirectory = Join-Path $script:RuntimeDirectory 'WebView2'
+        $runtimeFilesReady = @(
+            'Microsoft.Web.WebView2.Core.dll',
+            'Microsoft.Web.WebView2.Wpf.dll',
+            'WebView2Loader.dll'
+        ) | ForEach-Object { Test-Path -LiteralPath (Join-Path $webViewDirectory $_) }
+        if ($runtimeFilesReady -contains $false) {
+            $webViewDirectory = Join-Path $script:AppDirectory 'lib\WebView2'
+        }
         $coreAssembly = Join-Path $webViewDirectory 'Microsoft.Web.WebView2.Core.dll'
         $wpfAssembly = Join-Path $webViewDirectory 'Microsoft.Web.WebView2.Wpf.dll'
-        if (-not (Test-Path -LiteralPath $coreAssembly) -or -not (Test-Path -LiteralPath $wpfAssembly)) {
+        $loaderAssembly = Join-Path $webViewDirectory 'WebView2Loader.dll'
+        if (-not (Test-Path -LiteralPath $coreAssembly) -or -not (Test-Path -LiteralPath $wpfAssembly) -or -not (Test-Path -LiteralPath $loaderAssembly)) {
             throw '缺少 WebView2 登录组件，请重新解压完整项目。'
         }
 

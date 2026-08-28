@@ -9,3 +9,5 @@
 .analysis-app.js
 .tmp-webview2*
 .tmp-wv/
+.build/
+dist/
