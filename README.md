@@ -1,16 +1,22 @@
 # LanZ Monitor
 
-一个适用于 Windows 的轻量悬浮负载监控组件。它从兼容的模型状态 API 读取并展示各模型的当前并发量、容量、负载百分比及近期变化。
+一个适用于 Windows 的轻量悬浮监控组件。它展示模型负载、当日请求数、内外网模型额度、剩余额度和当前积分计费状态。
 
 ![LanZ Monitor 界面截图](docs/screenshot.png)
+
+![LanZ Monitor 设置菜单](docs/settings.png)
 
 ## 功能
 
 - 每 10 秒自动刷新，也可暂停或手动刷新。
+- 显示当日请求数，以及内网、外网模型额度的使用百分比和余量。
+- 从资源看板动态解析积分免费/计费规则，显示当前状态与下一次切换时间。
 - 自适应纵轴折线图会放大近期波动区间，并保留最近 5 小时的本地采样。
+- 轻量 JSONL 日志保存最近状态，重启后先恢复上次画面，再更新实时数据。
 - 绿、橙、红三档负载底色。
 - 模型卡片可拖动排序，并在本机保存顺序。
 - 大头钉可开启或取消窗口置顶。
+- 自动刷新、重新登录及两类额度的显示开关集中在右上角齿轮菜单。
 - 会话失效时通过 WebView2 打开登录页面并自动接收新 Cookie。
 - 连接配置和会话值使用 Windows DPAPI 加密，仅当前 Windows 用户可解密。
 
@@ -25,7 +31,7 @@
 
 1. 下载或克隆仓库。
 2. 双击 `setup-session.cmd`。
-3. 根据提示填写 API 地址、网页登录地址、Cookie 名称、请求令牌参数和接口状态代码。
+3. 根据提示填写模型状态 API、当日请求用量 API、资源看板页面、网页登录地址、Cookie 名称、请求令牌参数和接口状态代码。
 4. 输入当前会话值。敏感输入不会显示在终端中。
 5. 双击 `start-widget.cmd`。
 
@@ -40,12 +46,16 @@ pwsh -NoProfile -File .\Set-LanZSession.ps1 -Reconfigure
 ## 界面说明
 
 - 当前负载是模型卡片右上角的百分比。
+- “当日请求数”卡片显示内外网模型的已用额度、上限、百分比和余量；达到 80% 后变为红色提醒。
+- 积分时段由程序从资源看板的当前页面脚本解析，每 30 分钟检查更新；如果短暂无法读取，会沿用最近一次成功规则。该规则只代表积分是否扣减，不代表请求次数不计入日额度。
 - 折线图右上和右下的数字是当前纵轴上限与下限，并非当前负载。
 - 横轴采用非线性时间刻度：`5h → 1h → 30m → 15m → 50s → 40s → 30s → 20s → 10s → 0`，既保留长时间趋势，也放大最近五个 10 秒间隔。
 - 刚启动且历史不足时，缺少的早期区间会用淡色虚线平填；连续采样使用实线，超过 30 秒的数据缺口会断开显示。
 - 负载低于 60% 显示绿色，60%–84% 显示橙色，85% 及以上显示红色。
 - 按住模型卡片上下拖动可改变顺序。
 - 右上角大头钉亮起时窗口保持置顶。
+- 齿轮菜单中的显示选择和自动刷新状态会保存在本机 `.lanz-ui.json`。
+- 最近 5 小时负载采样保存在 `.lanz-history.json`，最近完整状态保存在 `.lanz-status.jsonl`；两者只存在本机且均不入库。
 
 ## 安全设计
 
@@ -53,6 +63,7 @@ pwsh -NoProfile -File .\Set-LanZSession.ps1 -Reconfigure
 - 程序不会读取网页登录密码，只读取配置指定域名在登录完成后设置的会话 Cookie。
 - WebView2 使用独立的持久化用户数据目录，不直接读取桌面版 Edge 的密码库。
 - 自动填充和密码保存由 WebView2 Runtime 管理。
+- 动态规则缓存、界面偏好、负载历史和状态日志都已被 `.gitignore` 排除。
 
 ## 数据格式
 
@@ -64,6 +75,12 @@ pwsh -NoProfile -File .\Set-LanZSession.ps1 -Reconfigure
 - `data[].routeStatus.total_active`：当前并发量
 - `data[].routeStatus.effective_max_concurrent`：有效容量
 - `data[].routeStatus.available`：可用状态
+
+当日用量 API 的 `data.overview` 需要包含：
+
+- `dailyRequestCount`：当日请求数
+- `externalDailyUsed` / `externalDailyLimit`：外网模型已用量与上限
+- `internalDailyUsed` / `internalDailyLimit`：内网模型已用量与上限
 
 负载计算方式为：
 

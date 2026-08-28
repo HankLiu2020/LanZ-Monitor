@@ -52,6 +52,8 @@ function Protect-AndSave {
 if ($Reconfigure -or -not (Test-Path -LiteralPath $configPath)) {
     Write-Host '首次配置：以下连接信息只会以 Windows DPAPI 加密形式保存在本机。' -ForegroundColor Cyan
     $apiEndpoint = (Read-Host '模型状态 API 的 HTTPS 地址').Trim()
+    $usageEndpoint = (Read-Host '当日请求用量 API 的 HTTPS 地址').Trim()
+    $usageDashboardUrl = (Read-Host '资源看板页面的 HTTPS 地址').Trim()
     $loginUrl = (Read-Host '网页登录入口的 HTTPS 地址').Trim()
     $sessionCookieName = (Read-Host '会话 Cookie 名称').Trim()
     $requestTokenHeader = (Read-Host '请求令牌 Header 名称').Trim()
@@ -62,9 +64,17 @@ if ($Reconfigure -or -not (Test-Path -LiteralPath $configPath)) {
     $unauthorizedCodeText = Read-Host '会话失效代码'
 
     $apiUri = $null
+    $usageUri = $null
+    $usageDashboardUri = $null
     $loginUri = $null
     if (-not [Uri]::TryCreate($apiEndpoint, [UriKind]::Absolute, [ref]$apiUri) -or $apiUri.Scheme -ne 'https') {
         throw 'API 地址必须是有效的 HTTPS URL。'
+    }
+    if (-not [Uri]::TryCreate($usageEndpoint, [UriKind]::Absolute, [ref]$usageUri) -or $usageUri.Scheme -ne 'https') {
+        throw '用量 API 地址必须是有效的 HTTPS URL。'
+    }
+    if (-not [Uri]::TryCreate($usageDashboardUrl, [UriKind]::Absolute, [ref]$usageDashboardUri) -or $usageDashboardUri.Scheme -ne 'https') {
+        throw '资源看板地址必须是有效的 HTTPS URL。'
     }
     if (-not [Uri]::TryCreate($loginUrl, [UriKind]::Absolute, [ref]$loginUri) -or $loginUri.Scheme -ne 'https') {
         throw '登录地址必须是有效的 HTTPS URL。'
@@ -90,6 +100,8 @@ if ($Reconfigure -or -not (Test-Path -LiteralPath $configPath)) {
 
     $configuration = [ordered]@{
         ApiEndpoint        = $apiEndpoint
+        UsageEndpoint      = $usageEndpoint
+        UsageDashboardUrl  = $usageDashboardUrl
         LoginUrl           = $loginUrl
         SessionCookieName  = $sessionCookieName
         RequestTokenHeader = $requestTokenHeader

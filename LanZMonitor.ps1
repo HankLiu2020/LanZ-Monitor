@@ -1,6 +1,7 @@
 param(
     [switch]$Once,
     [string]$ScreenshotPath,
+    [string]$SettingsScreenshotPath,
     [ValidateRange(2, 60)]
     [int]$RefreshSeconds = 10
 )
@@ -15,6 +16,13 @@ $script:LoginWindowOpen = $false
 $script:SuppressAutoLogin = $false
 $script:LoadHistory = @{}
 $script:HistoryPath = Join-Path $script:AppDirectory '.lanz-history.json'
+$script:UiPreferencesPath = Join-Path $script:AppDirectory '.lanz-ui.json'
+$script:BillingRulesPath = Join-Path $script:AppDirectory '.lanz-billing-rules.json'
+$script:StatusLogPath = Join-Path $script:AppDirectory '.lanz-status.jsonl'
+$script:BillingRules = $null
+$script:CachedStatusSnapshot = $null
+$script:StatusLogWriteCount = 0
+$script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $true; ShowInternalQuota = $true }
 $script:TimelineAges = @(18000.0, 3600.0, 1800.0, 900.0, 50.0, 40.0, 30.0, 20.0, 10.0, 0.0)
 $script:TimelineXs = @(0.0, 55.0, 105.0, 155.0, 218.0, 240.0, 262.0, 284.0, 307.0, 330.0)
 $script:ModelOrderPath = Join-Path $script:AppDirectory '.lanz-model-order.json'
@@ -36,6 +44,20 @@ catch {
     $script:ModelOrder.Clear()
 }
 
+try {
+    if (Test-Path -LiteralPath $script:UiPreferencesPath) {
+        $savedUiPreferences = Get-Content -LiteralPath $script:UiPreferencesPath -Raw | ConvertFrom-Json
+        foreach ($propertyName in @('AutoRefresh', 'ShowExternalQuota', 'ShowInternalQuota')) {
+            if ($null -ne $savedUiPreferences.PSObject.Properties[$propertyName]) {
+                $script:UiPreferences[$propertyName] = [bool]$savedUiPreferences.$propertyName
+            }
+        }
+    }
+}
+catch {
+    $script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $true; ShowInternalQuota = $true }
+}
+
 Add-Type -AssemblyName System.Security
 Add-Type -AssemblyName System.Net.Http
 
@@ -52,7 +74,7 @@ function Get-LanZConfiguration {
     )
     $configuration = [System.Text.Encoding]::UTF8.GetString($plainBytes) | ConvertFrom-Json
 
-    foreach ($propertyName in @('ApiEndpoint', 'LoginUrl', 'SessionCookieName', 'RequestTokenHeader', 'RequestTokenPrefix', 'RequestTokenKey', 'RequestTokenIV', 'SuccessCode', 'UnauthorizedCode')) {
+    foreach ($propertyName in @('ApiEndpoint', 'UsageEndpoint', 'UsageDashboardUrl', 'LoginUrl', 'SessionCookieName', 'RequestTokenHeader', 'RequestTokenPrefix', 'RequestTokenKey', 'RequestTokenIV', 'SuccessCode', 'UnauthorizedCode')) {
         if ($null -eq $configuration.PSObject.Properties[$propertyName]) {
             throw "连接配置缺少 $propertyName，请重新运行 setup-session.cmd。"
         }
@@ -63,6 +85,14 @@ function Get-LanZConfiguration {
     if (-not [Uri]::TryCreate([string]$configuration.ApiEndpoint, [UriKind]::Absolute, [ref]$apiUri) -or $apiUri.Scheme -ne 'https') {
         throw 'API 地址必须是有效的 HTTPS URL。'
     }
+    $usageUri = $null
+    if (-not [Uri]::TryCreate([string]$configuration.UsageEndpoint, [UriKind]::Absolute, [ref]$usageUri) -or $usageUri.Scheme -ne 'https') {
+        throw '用量 API 地址必须是有效的 HTTPS URL。'
+    }
+    $usageDashboardUri = $null
+    if (-not [Uri]::TryCreate([string]$configuration.UsageDashboardUrl, [UriKind]::Absolute, [ref]$usageDashboardUri) -or $usageDashboardUri.Scheme -ne 'https') {
+        throw '资源看板地址必须是有效的 HTTPS URL。'
+    }
     if (-not [Uri]::TryCreate([string]$configuration.LoginUrl, [UriKind]::Absolute, [ref]$loginUri) -or $loginUri.Scheme -ne 'https') {
         throw '登录地址必须是有效的 HTTPS URL。'
     }
@@ -72,6 +102,8 @@ function Get-LanZConfiguration {
 
 $script:Configuration = Get-LanZConfiguration
 $script:Endpoint = [string]$script:Configuration.ApiEndpoint
+$script:UsageEndpoint = [string]$script:Configuration.UsageEndpoint
+$script:UsageDashboardUrl = [string]$script:Configuration.UsageDashboardUrl
 $script:LoginUrl = [string]$script:Configuration.LoginUrl
 $script:SessionCookieName = [string]$script:Configuration.SessionCookieName
 
@@ -226,6 +258,362 @@ function Get-LanZModels {
     }
 }
 
+function Get-LanZUsageOverview {
+    param([string]$SessionValue)
+
+    if ([string]::IsNullOrWhiteSpace($SessionValue)) {
+        $SessionValue = Get-LanZSessionValue
+    }
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.CheckCertificateRevocationList = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $request = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::Get,
+        $script:UsageEndpoint
+    )
+
+    try {
+        [void]$request.Headers.TryAddWithoutValidation('Cookie', "$($script:SessionCookieName)=$SessionValue")
+        [void]$request.Headers.TryAddWithoutValidation([string]$script:Configuration.RequestTokenHeader, (New-LanZRequestToken))
+        $response = $client.SendAsync($request).GetAwaiter().GetResult()
+        $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+            throw "用量服务返回 HTTP $([int]$response.StatusCode)"
+        }
+
+        $payload = $content | ConvertFrom-Json
+        if ([int]$payload.code -ne [int]$script:Configuration.SuccessCode) {
+            if ([int]$payload.code -eq [int]$script:Configuration.UnauthorizedCode) {
+                throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
+            }
+            throw "用量接口错误：$($payload.msg)"
+        }
+        return $payload.data.overview
+    }
+    finally {
+        $request.Dispose()
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Get-LanZAuthenticatedText {
+    param(
+        [Parameter(Mandatory)][Uri]$Uri,
+        [Parameter(Mandatory)][string]$SessionValue
+    )
+
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.CheckCertificateRevocationList = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Uri)
+    try {
+        [void]$request.Headers.TryAddWithoutValidation('Cookie', "$($script:SessionCookieName)=$SessionValue")
+        $response = $client.SendAsync($request).GetAwaiter().GetResult()
+        $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if ([int]$response.StatusCode -in @(401, 403)) {
+            throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
+        }
+        if (-not $response.IsSuccessStatusCode) {
+            throw "规则页面返回 HTTP $([int]$response.StatusCode)"
+        }
+        return $content
+    }
+    finally {
+        $request.Dispose()
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Import-LanZBillingRulesCache {
+    if ($null -ne $script:BillingRules) {
+        return $script:BillingRules
+    }
+    try {
+        if (Test-Path -LiteralPath $script:BillingRulesPath) {
+            $cached = Get-Content -LiteralPath $script:BillingRulesPath -Raw | ConvertFrom-Json
+            if (@($cached.Intervals).Count -gt 0) {
+                $script:BillingRules = $cached
+            }
+        }
+    }
+    catch {
+        $script:BillingRules = $null
+    }
+    return $script:BillingRules
+}
+
+function Get-LanZBillingRules {
+    param([Parameter(Mandatory)][string]$SessionValue)
+
+    $cached = Import-LanZBillingRulesCache
+    if ($null -ne $cached) {
+        try {
+            $fetchedAt = [DateTime]::Parse(
+                [string]$cached.FetchedAt,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            ).ToUniversalTime()
+            if (([DateTime]::UtcNow - $fetchedAt).TotalMinutes -lt 30) {
+                return $cached
+            }
+        }
+        catch {
+            # An old cache is still a safe fallback if refreshing the source fails.
+        }
+    }
+
+    try {
+        $dashboardUri = [Uri]$script:UsageDashboardUrl
+        $dashboardHtml = Get-LanZAuthenticatedText -Uri $dashboardUri -SessionValue $SessionValue
+        $scriptMatches = [regex]::Matches(
+            $dashboardHtml,
+            '<script\b[^>]*\bsrc\s*=\s*(?:"(?<src>[^"]+)"|''(?<src>[^'']+)''|(?<src>[^\s>]+))',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        $scriptUris = @($scriptMatches | ForEach-Object {
+            [Uri]::new($dashboardUri, $_.Groups['src'].Value)
+        })
+        $runtimeUri = $scriptUris | Where-Object { [IO.Path]::GetFileName($_.AbsolutePath) -match '^runtime\.' } | Select-Object -First 1
+        $appUri = $scriptUris | Where-Object { [IO.Path]::GetFileName($_.AbsolutePath) -match '^app\.' } | Select-Object -First 1
+        if ($null -eq $runtimeUri -or $null -eq $appUri) {
+            throw '资源看板的前端入口未找到。'
+        }
+
+        $runtimeText = Get-LanZAuthenticatedText -Uri $runtimeUri -SessionValue $SessionValue
+        $appText = Get-LanZAuthenticatedText -Uri $appUri -SessionValue $SessionValue
+        $routePath = $dashboardUri.AbsolutePath
+        $chunkIds = [System.Collections.Generic.HashSet[string]]::new()
+        $preferredChunkIds = [System.Collections.Generic.List[string]]::new()
+        foreach ($routeMatch in [regex]::Matches($appText, [regex]::Escape($routePath))) {
+            $start = [math]::Max(0, $routeMatch.Index - 8000)
+            $length = [math]::Min(16000, $appText.Length - $start)
+            $context = $appText.Substring($start, $length)
+            foreach ($chunkMatch in [regex]::Matches($context, '\.e\((?<id>\d+)\)')) {
+                [void]$chunkIds.Add($chunkMatch.Groups['id'].Value)
+            }
+        }
+        $routeSegment = $routePath.TrimEnd('/').Split('/')[-1]
+        if (-not [string]::IsNullOrWhiteSpace($routeSegment)) {
+            $routeEntryPattern = 'path\s*:\s*["'']{0}["'']' -f [regex]::Escape($routeSegment)
+            foreach ($routeEntryMatch in [regex]::Matches($appText, $routeEntryPattern)) {
+                $start = [math]::Max(0, $routeEntryMatch.Index - 500)
+                $length = [math]::Min(2500, $appText.Length - $start)
+                $context = $appText.Substring($start, $length)
+                foreach ($chunkMatch in [regex]::Matches($context, '\.e\((?<id>\d+)\)')) {
+                    $candidateId = $chunkMatch.Groups['id'].Value
+                    if (-not $preferredChunkIds.Contains($candidateId)) {
+                        $preferredChunkIds.Add($candidateId)
+                    }
+                    [void]$chunkIds.Add($candidateId)
+                }
+            }
+        }
+        if ($chunkIds.Count -eq 0) {
+            throw '无法定位资源看板的动态脚本。'
+        }
+
+        $ruleText = $null
+        $timeRangePattern = '(?<start>\d{1,2}:\d{2})\s*(?:-|~|–|—|至)\s*(?<next>次日)?\s*(?<end>\d{1,2}:\d{2})'
+        $candidateChunkIds = @($preferredChunkIds) + @($chunkIds) | Select-Object -Unique
+        foreach ($chunkId in $candidateChunkIds) {
+            $hashPattern = '(?<!\d){0}:"(?<hash>[a-f0-9]+)"' -f [regex]::Escape($chunkId)
+            $hashMatch = [regex]::Match($runtimeText, $hashPattern)
+            if (-not $hashMatch.Success) {
+                continue
+            }
+            $chunkUri = [Uri]::new($runtimeUri, "$chunkId.$($hashMatch.Groups['hash'].Value).js")
+            $chunkText = Get-LanZAuthenticatedText -Uri $chunkUri -SessionValue $SessionValue
+            $descriptionMatch = [regex]::Match(
+                $chunkText,
+                'billingFreeDesc\s*:\s*function\(\)\s*\{\s*return\s*"(?<text>(?:\\.|[^"\\])*)"'
+            )
+            $encodedCandidates = [System.Collections.Generic.List[string]]::new()
+            if ($descriptionMatch.Success) {
+                $encodedCandidates.Add($descriptionMatch.Groups['text'].Value)
+            }
+            foreach ($stringMatch in [regex]::Matches($chunkText, '"(?<text>(?:\\.|[^"\\])*)"')) {
+                $candidateText = $stringMatch.Groups['text'].Value
+                if ($candidateText.Length -ge 20 -and $candidateText.Length -le 1200 -and $candidateText -match '\d{1,2}:\d{2}') {
+                    $encodedCandidates.Add($candidateText)
+                }
+            }
+            foreach ($encoded in $encodedCandidates) {
+                try {
+                    $decodedCandidate = ('"' + $encoded + '"') | ConvertFrom-Json
+                }
+                catch {
+                    $decodedCandidate = $encoded -replace '\\n', ' ' -replace '\\"', '"' -replace '\\\\', '\'
+                }
+                $plainCandidate = [Net.WebUtility]::HtmlDecode(([regex]::Replace($decodedCandidate, '<[^>]+>', ' ')))
+                if ([regex]::Matches($plainCandidate, $timeRangePattern).Count -ge 2 -and $plainCandidate -match '积分|免费|扣减') {
+                    $ruleText = $decodedCandidate
+                    break
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($ruleText)) {
+                break
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($ruleText)) {
+            throw '资源看板未提供可解析的积分时段说明。'
+        }
+
+        $plainRuleText = [Net.WebUtility]::HtmlDecode(([regex]::Replace($ruleText, '<[^>]+>', ' ')))
+        $plainRuleText = [regex]::Replace($plainRuleText, '\s+', ' ').Trim()
+        $intervals = @([regex]::Matches(
+            $plainRuleText,
+            $timeRangePattern
+        ) | ForEach-Object {
+            $startParts = $_.Groups['start'].Value.Split(':')
+            $endParts = $_.Groups['end'].Value.Split(':')
+            $startMinutes = ([int]$startParts[0] * 60) + [int]$startParts[1]
+            $endMinutes = ([int]$endParts[0] * 60) + [int]$endParts[1]
+            [pscustomobject]@{
+                StartMinutes = $startMinutes
+                EndMinutes = $endMinutes
+                Overnight = $_.Groups['next'].Success -or $endMinutes -le $startMinutes
+            }
+        })
+        if ($intervals.Count -eq 0) {
+            throw '积分时段说明中没有可用的时间区间。'
+        }
+
+        $rules = [pscustomobject]@{
+            FetchedAt = [DateTime]::UtcNow.ToString('o')
+            ScheduleText = $plainRuleText
+            WeekendFree = [bool]($plainRuleText -match '周(?:六周日|末).*?全天')
+            Intervals = $intervals
+        }
+        [IO.File]::WriteAllText(
+            $script:BillingRulesPath,
+            ($rules | ConvertTo-Json -Depth 5 -Compress),
+            [Text.UTF8Encoding]::new($false)
+        )
+        $script:BillingRules = $rules
+        return $rules
+    }
+    catch [System.UnauthorizedAccessException] {
+        throw
+    }
+    catch {
+        if ($null -ne $cached) {
+            return $cached
+        }
+        return $null
+    }
+}
+
+function Get-LanZBillingWindowStatus {
+    param([object]$Rules)
+
+    if ($null -eq $Rules -or @($Rules.Intervals).Count -eq 0) {
+        return [pscustomobject]@{ IsFree = $null; Status = '计费状态未知'; Detail = '规则同步中' }
+    }
+
+    function Test-LanZFreeTime {
+        param([Parameter(Mandatory)][DateTime]$LocalTime)
+
+        if ([bool]$Rules.WeekendFree -and $LocalTime.DayOfWeek -in @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)) {
+            return $true
+        }
+        $minutes = ($LocalTime.Hour * 60) + $LocalTime.Minute
+        foreach ($interval in @($Rules.Intervals)) {
+            $start = [int]$interval.StartMinutes
+            $end = [int]$interval.EndMinutes
+            if ([bool]$interval.Overnight) {
+                if ($minutes -ge $start -or $minutes -lt $end) {
+                    return $true
+                }
+            }
+            elseif ($minutes -ge $start -and $minutes -lt $end) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    $timeZone = [TimeZoneInfo]::FindSystemTimeZoneById('China Standard Time')
+    $now = [TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $timeZone)
+    $isFree = Test-LanZFreeTime -LocalTime $now
+    $switchTime = $null
+    $cursor = [DateTime]::new($now.Year, $now.Month, $now.Day, $now.Hour, $now.Minute, 0).AddMinutes(1)
+    for ($offset = 0; $offset -lt (8 * 24 * 60); $offset++) {
+        if ((Test-LanZFreeTime -LocalTime $cursor) -ne $isFree) {
+            $switchTime = $cursor
+            break
+        }
+        $cursor = $cursor.AddMinutes(1)
+    }
+
+    $detail = '规则已同步'
+    if ($null -ne $switchTime) {
+        $dayPrefix = if ($switchTime.Date -eq $now.Date) {
+            ''
+        }
+        elseif ($switchTime.Date -eq $now.Date.AddDays(1)) {
+            '明天 '
+        }
+        else {
+            @('周日 ', '周一 ', '周二 ', '周三 ', '周四 ', '周五 ', '周六 ')[[int]$switchTime.DayOfWeek]
+        }
+        $detail = $dayPrefix + $switchTime.ToString('HH:mm') + $(if ($isFree) { ' 后计费' } else { ' 起免费' })
+    }
+    return [pscustomobject]@{
+        IsFree = $isFree
+        Status = if ($isFree) { '当前是积分免费时段' } else { '当前是积分计费时段' }
+        Detail = $detail
+    }
+}
+
+function New-LanZQuotaViewModel {
+    param(
+        [Parameter(Mandatory)][object]$Overview,
+        [object]$BillingRules
+    )
+
+    function Get-QuotaDisplay {
+        param([int]$Used, [int]$Limit)
+
+        $unlimited = $Limit -eq -1
+        $percent = if ($unlimited -or $Limit -le 0) { 0 } else { [math]::Min(100, [math]::Round($Used * 100 / $Limit)) }
+        $remaining = if ($unlimited) { '不限额' } elseif ($Used -gt $Limit) { '超 ' + ($Used - $Limit) } else { '余 ' + ($Limit - $Used) }
+        return [pscustomobject]@{
+            Usage = if ($unlimited) { "$Used / 不限额" } else { "$Used / $Limit" }
+            Percent = "$percent%"
+            ProgressWidth = [double](3.32 * $percent)
+            Remaining = $remaining
+            Color = if (-not $unlimited -and $percent -ge 80) { '#F56C6C' } else { '#45C391' }
+            Warning = if (-not $unlimited -and $percent -ge 80) { '⚠ 已达 80%' } else { '' }
+        }
+    }
+
+    $external = Get-QuotaDisplay -Used ([int]$Overview.externalDailyUsed) -Limit ([int]$Overview.externalDailyLimit)
+    $internal = Get-QuotaDisplay -Used ([int]$Overview.internalDailyUsed) -Limit ([int]$Overview.internalDailyLimit)
+    $billing = Get-LanZBillingWindowStatus -Rules $BillingRules
+    return [pscustomobject]@{
+        RequestCount = ([int]$Overview.dailyRequestCount).ToString('N0')
+        ExternalUsage = $external.Usage
+        ExternalPercent = $external.Percent
+        ExternalProgressWidth = $external.ProgressWidth
+        ExternalRemaining = $external.Remaining
+        ExternalColor = $external.Color
+        ExternalWarning = $external.Warning
+        InternalUsage = $internal.Usage
+        InternalPercent = $internal.Percent
+        InternalProgressWidth = $internal.ProgressWidth
+        InternalRemaining = $internal.Remaining
+        InternalColor = $internal.Color
+        InternalWarning = $internal.Warning
+        BillingStatus = $billing.Status
+        BillingDetail = $billing.Detail
+        BillingBackground = if ($null -eq $billing.IsFree) { '#EEF2F5' } elseif ($billing.IsFree) { '#E6F7F0' } else { '#FFF2D8' }
+        BillingForeground = if ($null -eq $billing.IsFree) { '#6F7F8B' } elseif ($billing.IsFree) { '#178A63' } else { '#A86812' }
+        BillingSource = if ($null -eq $BillingRules) { '计费规则尚未同步' } else { '计费规则已从资源看板同步' }
+    }
+}
+
 if ($Once) {
     Get-LanZModels | Select-Object Name, ModelId, Active, Capacity, Percent, Available | ConvertTo-Json -Depth 3
     exit 0
@@ -285,6 +673,100 @@ function Initialize-LanZHistory {
     }
 }
 
+function Initialize-LanZStatusSnapshot {
+    if (-not (Test-Path -LiteralPath $script:StatusLogPath)) {
+        return
+    }
+    try {
+        $lastLine = [IO.File]::ReadLines($script:StatusLogPath) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Last 1
+        if (-not [string]::IsNullOrWhiteSpace($lastLine)) {
+            $script:CachedStatusSnapshot = $lastLine | ConvertFrom-Json
+        }
+    }
+    catch {
+        $script:CachedStatusSnapshot = $null
+    }
+}
+
+function Save-LanZStatusSnapshot {
+    param(
+        [Parameter(Mandatory)][array]$Models,
+        [Parameter(Mandatory)][object]$Overview
+    )
+
+    $snapshot = [ordered]@{
+        Timestamp = [DateTime]::UtcNow.ToString('o')
+        Models = @($Models | ForEach-Object {
+            [ordered]@{
+                Name = [string]$_.Name
+                ModelId = [string]$_.ModelId
+                Active = [int]$_.Active
+                Capacity = [int]$_.Capacity
+                Percent = [int]$_.Percent
+                Available = [bool]$_.Available
+                Summary = [string]$_.Summary
+                Color = [string]$_.Color
+                CardBackground = [string]$_.CardBackground
+                CardBorder = [string]$_.CardBorder
+            }
+        })
+        Usage = [ordered]@{
+            dailyRequestCount = [int]$Overview.dailyRequestCount
+            externalDailyUsed = [int]$Overview.externalDailyUsed
+            externalDailyLimit = [int]$Overview.externalDailyLimit
+            internalDailyUsed = [int]$Overview.internalDailyUsed
+            internalDailyLimit = [int]$Overview.internalDailyLimit
+        }
+    }
+    $line = ($snapshot | ConvertTo-Json -Depth 6 -Compress) + [Environment]::NewLine
+    [IO.File]::AppendAllText($script:StatusLogPath, $line, [Text.UTF8Encoding]::new($false))
+    $script:CachedStatusSnapshot = $line.TrimEnd() | ConvertFrom-Json
+    $script:StatusLogWriteCount++
+
+    $logSize = (Get-Item -LiteralPath $script:StatusLogPath).Length
+    if ($script:StatusLogWriteCount % 60 -ne 0 -and $logSize -lt 2MB) {
+        return
+    }
+
+    try {
+        $cutoff = [DateTime]::UtcNow.AddHours(-5)
+        $retained = [System.Collections.Generic.List[string]]::new()
+        foreach ($existingLine in [IO.File]::ReadLines($script:StatusLogPath)) {
+            if ([string]::IsNullOrWhiteSpace($existingLine)) {
+                continue
+            }
+            try {
+                $existing = $existingLine | ConvertFrom-Json
+                $timestamp = [DateTime]::Parse(
+                    [string]$existing.Timestamp,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind
+                ).ToUniversalTime()
+                if ($timestamp -ge $cutoff) {
+                    $retained.Add($existingLine)
+                }
+            }
+            catch {
+                # Ignore a partial/corrupt log line; later valid samples remain usable.
+            }
+        }
+        if ($retained.Count -gt 2000) {
+            $lastLines = @($retained | Select-Object -Last 2000)
+            $retained.Clear()
+            foreach ($lastLine in $lastLines) {
+                $retained.Add($lastLine)
+            }
+        }
+        $content = if ($retained.Count -gt 0) { ($retained -join [Environment]::NewLine) + [Environment]::NewLine } else { '' }
+        [IO.File]::WriteAllText($script:StatusLogPath, $content, [Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        # Snapshot logging is best effort and must never interrupt live monitoring.
+    }
+}
+
 function Save-LanZHistory {
     $payload = [ordered]@{}
     foreach ($key in @($script:LoadHistory.Keys)) {
@@ -324,10 +806,18 @@ function Get-LanZTimelineX {
 }
 
 function Add-LanZChartHistory {
-    param([Parameter(Mandatory)][array]$Models)
+    param(
+        [Parameter(Mandatory)][array]$Models,
+        [DateTime]$SampleTimestamp = [DateTime]::UtcNow,
+        [switch]$SkipPersistence
+    )
 
     $now = [DateTime]::UtcNow
+    $sampleTime = $SampleTimestamp.ToUniversalTime()
     $cutoff = $now.AddHours(-5)
+    if ($sampleTime -lt $cutoff) {
+        $sampleTime = $cutoff
+    }
     foreach ($model in $Models) {
         $key = [string]$model.ModelId
         if (-not $script:LoadHistory.ContainsKey($key)) {
@@ -335,10 +825,13 @@ function Add-LanZChartHistory {
         }
 
         $history = $script:LoadHistory[$key]
-        $history.Add([pscustomobject]@{
-            Timestamp = $now
-            Percent = [int]$model.Percent
-        })
+        $lastSample = if ($history.Count -gt 0) { $history[$history.Count - 1] } else { $null }
+        if ($null -eq $lastSample -or [math]::Abs(($lastSample.Timestamp - $sampleTime).TotalSeconds) -gt 2) {
+            $history.Add([pscustomobject]@{
+                Timestamp = $sampleTime
+                Percent = [int]$model.Percent
+            })
+        }
         while ($history.Count -gt 0 -and $history[0].Timestamp -lt $cutoff) {
             $history.RemoveAt(0)
         }
@@ -413,16 +906,19 @@ function Add-LanZChartHistory {
         )) -Force
     }
 
-    try {
-        Save-LanZHistory
-    }
-    catch {
-        # History persistence is optional; a write failure must not stop live monitoring.
+    if (-not $SkipPersistence) {
+        try {
+            Save-LanZHistory
+        }
+        catch {
+            # History persistence is optional; a write failure must not stop live monitoring.
+        }
     }
     return $Models
 }
 
 Initialize-LanZHistory
+Initialize-LanZStatusSnapshot
 
 function Save-LanZModelOrder {
     $json = ConvertTo-Json -InputObject @($script:ModelOrder) -Compress
@@ -476,7 +972,7 @@ function Get-LanZModelFromVisual {
 
 function Export-LanZWindowScreenshot {
     param(
-        [Parameter(Mandatory)][Windows.Window]$TargetWindow,
+        [Parameter(Mandatory)][Windows.FrameworkElement]$TargetWindow,
         [Parameter(Mandatory)][string]$Path
     )
 
@@ -511,7 +1007,7 @@ function Export-LanZWindowScreenshot {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="LanZ 负载监控"
-        Width="410" Height="420"
+        Width="430" Height="560"
         WindowStyle="None" ResizeMode="NoResize"
         AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="True"
@@ -550,16 +1046,16 @@ function Export-LanZWindowScreenshot {
         </Border.Effect>
         <Grid>
             <Grid.RowDefinitions>
-                <RowDefinition Height="58"/>
+                <RowDefinition Height="52"/>
+                <RowDefinition x:Name="UsageRowDefinition" Height="138"/>
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
 
             <Grid x:Name="DragArea" Grid.Row="0" Background="Transparent">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="76"/>
-                    <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="34"/>
+                    <ColumnDefinition Width="36"/>
                     <ColumnDefinition Width="36"/>
                     <ColumnDefinition Width="36"/>
                 </Grid.ColumnDefinitions>
@@ -567,14 +1063,69 @@ function Export-LanZWindowScreenshot {
                     <TextBlock Text="LanZ 负载" FontSize="17" FontWeight="SemiBold" Foreground="#263746"/>
                     <TextBlock x:Name="UpdatedText" Text="正在连接…" Margin="0,4,0,0" FontSize="11" Foreground="#8694A0" TextTrimming="CharacterEllipsis"/>
                 </StackPanel>
-                <ToggleButton x:Name="AutoRefreshToggle" Grid.Column="1" Content="自动刷新" IsChecked="True" Width="70" Height="25" FontSize="11" Style="{StaticResource AutoToggleStyle}" ToolTip="开关自动刷新"/>
-                <Button x:Name="LoginButton" Grid.Column="2" Content="重新登录" Visibility="Collapsed" Padding="8,3" Margin="4,0" FontSize="11" Foreground="#5A47E5" Background="#F0EEFF" BorderBrush="#D9D3FF" Cursor="Hand"/>
-                <ToggleButton x:Name="PinToggle" Grid.Column="3" Content="📌" IsChecked="True" Width="30" Height="25" FontSize="13" Style="{StaticResource AutoToggleStyle}" ToolTip="已置顶，点击取消"/>
-                <Button x:Name="RefreshButton" Grid.Column="4" Content="↻" FontSize="18" Foreground="#536675" Background="Transparent" BorderThickness="0" Cursor="Hand" ToolTip="立即刷新"/>
-                <Button x:Name="CloseButton" Grid.Column="5" Content="×" FontSize="20" Foreground="#536675" Background="Transparent" BorderThickness="0" Cursor="Hand" ToolTip="关闭"/>
+                <ToggleButton x:Name="PinToggle" Grid.Column="1" Content="📌" IsChecked="True" Width="30" Height="25" FontSize="13" Style="{StaticResource AutoToggleStyle}" ToolTip="已置顶，点击取消"/>
+                <Button x:Name="RefreshButton" Grid.Column="2" Content="↻" FontSize="18" Foreground="#536675" Background="Transparent" BorderThickness="0" Cursor="Hand" ToolTip="立即刷新"/>
+                <ToggleButton x:Name="SettingsButton" Grid.Column="3" Content="⚙" Width="30" Height="25" FontSize="15" Style="{StaticResource AutoToggleStyle}" ToolTip="设置"/>
+                <Button x:Name="CloseButton" Grid.Column="4" Content="×" FontSize="20" Foreground="#536675" Background="Transparent" BorderThickness="0" Cursor="Hand" ToolTip="关闭"/>
             </Grid>
 
-            <ItemsControl x:Name="ModelsList" Grid.Row="1" AllowDrop="True">
+            <Border x:Name="UsageCard" Grid.Row="1" Background="#FFFFFF" BorderBrush="#E2E8ED" BorderThickness="1" CornerRadius="11" Padding="12,8" Margin="0,0,0,8">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="32"/>
+                        <RowDefinition x:Name="ExternalQuotaRowDefinition" Height="30"/>
+                        <RowDefinition x:Name="InternalQuotaRowDefinition" Height="30"/>
+                        <RowDefinition Height="18"/>
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="当日请求数" FontSize="12" Foreground="#61727E" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="{Binding RequestCount}" FontSize="22" FontWeight="SemiBold" Foreground="#263746" Margin="8,-2,0,0"/>
+                        <Border Grid.Column="3" Background="{Binding BillingBackground}" CornerRadius="8" Padding="8,3">
+                            <StackPanel>
+                                <TextBlock Text="{Binding BillingStatus}" FontSize="10" FontWeight="SemiBold" Foreground="{Binding BillingForeground}" HorizontalAlignment="Center"/>
+                                <TextBlock Text="{Binding BillingDetail}" FontSize="8.5" Foreground="{Binding BillingForeground}" HorizontalAlignment="Center"/>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+                    <Grid x:Name="ExternalQuotaRow" Grid.Row="1">
+                        <Grid.RowDefinitions><RowDefinition Height="20"/><RowDefinition Height="6"/></Grid.RowDefinitions>
+                        <Grid Grid.Row="0">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                            <TextBlock Text="外网模型" FontSize="11" FontWeight="SemiBold" Foreground="#435663"/>
+                            <TextBlock Grid.Column="1" Text="{Binding ExternalUsage}" FontSize="10.5" Foreground="#61727E" Margin="8,0,0,0"/>
+                            <TextBlock Grid.Column="2" Text="{Binding ExternalPercent}" FontSize="10" Foreground="{Binding ExternalColor}" Margin="7,0,0,0"/>
+                            <TextBlock Grid.Column="3" Text="{Binding ExternalWarning}" FontSize="9.5" Foreground="#F56C6C" Margin="8,0,0,0"/>
+                            <TextBlock Grid.Column="4" Text="{Binding ExternalRemaining}" FontSize="10.5" FontWeight="SemiBold" Foreground="{Binding ExternalColor}"/>
+                        </Grid>
+                        <Border Grid.Row="1" Height="5" Background="#EDF2F5" CornerRadius="3">
+                            <Border Width="{Binding ExternalProgressWidth}" HorizontalAlignment="Left" Background="{Binding ExternalColor}" CornerRadius="3"/>
+                        </Border>
+                    </Grid>
+                    <Grid x:Name="InternalQuotaRow" Grid.Row="2">
+                        <Grid.RowDefinitions><RowDefinition Height="20"/><RowDefinition Height="6"/></Grid.RowDefinitions>
+                        <Grid Grid.Row="0">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                            <TextBlock Text="内网模型" FontSize="11" FontWeight="SemiBold" Foreground="#435663"/>
+                            <TextBlock Grid.Column="1" Text="{Binding InternalUsage}" FontSize="10.5" Foreground="#61727E" Margin="8,0,0,0"/>
+                            <TextBlock Grid.Column="2" Text="{Binding InternalPercent}" FontSize="10" Foreground="{Binding InternalColor}" Margin="7,0,0,0"/>
+                            <TextBlock Grid.Column="3" Text="{Binding InternalWarning}" FontSize="9.5" Foreground="#F56C6C" Margin="8,0,0,0"/>
+                            <TextBlock Grid.Column="4" Text="{Binding InternalRemaining}" FontSize="10.5" FontWeight="SemiBold" Foreground="{Binding InternalColor}"/>
+                        </Grid>
+                        <Border Grid.Row="1" Height="5" Background="#EDF2F5" CornerRadius="3">
+                            <Border Width="{Binding InternalProgressWidth}" HorizontalAlignment="Left" Background="{Binding InternalColor}" CornerRadius="3"/>
+                        </Border>
+                    </Grid>
+                    <TextBlock Grid.Row="3" Text="{Binding BillingSource}" FontSize="8.5" Foreground="#8A98A3" VerticalAlignment="Bottom"/>
+                </Grid>
+            </Border>
+
+            <ItemsControl x:Name="ModelsList" Grid.Row="2" AllowDrop="True">
                 <ItemsControl.ItemTemplate>
                     <DataTemplate>
                         <Border Background="{Binding CardBackground}" BorderBrush="{Binding CardBorder}" BorderThickness="1" CornerRadius="10" Padding="12,8" Margin="0,0,0,8" Cursor="SizeNS" ToolTip="拖动可调整模型顺序">
@@ -631,6 +1182,20 @@ function Export-LanZWindowScreenshot {
                 </ItemsControl.ItemTemplate>
             </ItemsControl>
 
+            <Popup x:Name="SettingsPopup" PlacementTarget="{Binding ElementName=SettingsButton}" Placement="Bottom" HorizontalOffset="-160" VerticalOffset="4" StaysOpen="False" AllowsTransparency="True">
+                <Border Width="196" Background="#FFFFFF" BorderBrush="#DCE4EA" BorderThickness="1" CornerRadius="10" Padding="12">
+                    <Border.Effect><DropShadowEffect BlurRadius="14" ShadowDepth="3" Opacity="0.22" Color="#203040"/></Border.Effect>
+                    <StackPanel>
+                        <TextBlock Text="显示与刷新" FontSize="11" FontWeight="SemiBold" Foreground="#314452" Margin="2,0,0,7"/>
+                        <CheckBox x:Name="AutoRefreshToggle" Content="自动刷新（10 秒）" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
+                        <CheckBox x:Name="ShowExternalQuotaToggle" Content="显示外网模型额度" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
+                        <CheckBox x:Name="ShowInternalQuotaToggle" Content="显示内网模型额度" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
+                        <Separator Margin="0,7,0,7" Background="#E7ECEF"/>
+                        <Button x:Name="LoginButton" Content="重新登录 / 切换凭据" Height="29" FontSize="11" Foreground="#5A47E5" Background="#F0EEFF" BorderBrush="#D9D3FF" Cursor="Hand"/>
+                    </StackPanel>
+                </Border>
+            </Popup>
+
         </Grid>
     </Border>
 </Window>
@@ -639,15 +1204,30 @@ function Export-LanZWindowScreenshot {
 $reader = [System.Xml.XmlNodeReader]::new($xaml)
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $modelsList = $window.FindName('ModelsList')
+$usageCard = $window.FindName('UsageCard')
+$usageRowDefinition = $window.FindName('UsageRowDefinition')
+$externalQuotaRow = $window.FindName('ExternalQuotaRow')
+$internalQuotaRow = $window.FindName('InternalQuotaRow')
+$externalQuotaRowDefinition = $window.FindName('ExternalQuotaRowDefinition')
+$internalQuotaRowDefinition = $window.FindName('InternalQuotaRowDefinition')
 $updatedText = $window.FindName('UpdatedText')
 $pinToggle = $window.FindName('PinToggle')
 $refreshButton = $window.FindName('RefreshButton')
 $closeButton = $window.FindName('CloseButton')
 $dragArea = $window.FindName('DragArea')
 $autoRefreshToggle = $window.FindName('AutoRefreshToggle')
+$showExternalQuotaToggle = $window.FindName('ShowExternalQuotaToggle')
+$showInternalQuotaToggle = $window.FindName('ShowInternalQuotaToggle')
+$settingsButton = $window.FindName('SettingsButton')
+$settingsPopup = $window.FindName('SettingsPopup')
 $loginButton = $window.FindName('LoginButton')
+$autoRefreshToggle.IsChecked = [bool]$script:UiPreferences.AutoRefresh
+$showExternalQuotaToggle.IsChecked = [bool]$script:UiPreferences.ShowExternalQuota
+$showInternalQuotaToggle.IsChecked = [bool]$script:UiPreferences.ShowInternalQuota
 
 function Show-LanZLogin {
+    param([switch]$ClearExistingSession)
+
     if ($script:LoginWindowOpen) {
         return
     }
@@ -741,6 +1321,9 @@ function Show-LanZLogin {
                     $webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = $false
                     $webView.CoreWebView2.Profile.IsPasswordAutosaveEnabled = $true
                     $webView.CoreWebView2.Profile.IsGeneralAutofillEnabled = $true
+                    if ($ClearExistingSession) {
+                        $webView.CoreWebView2.CookieManager.DeleteAllCookies()
+                    }
                     $webView.Source = [Uri]$script:LoginUrl
                     $loginStatusText.Text = '请完成登录；可选择保存密码，成功后会自动保存会话并关闭。'
                     $loginState.Stage = 'cookies'
@@ -796,7 +1379,6 @@ function Show-LanZLogin {
             $script:LoginWindowOpen = $false
             if ($loginState.Success) {
                 $script:SuppressAutoLogin = $false
-                $loginButton.Visibility = [Windows.Visibility]::Collapsed
                 $autoRefreshToggle.IsChecked = $true
                 Update-Widget
                 $timer.Start()
@@ -804,7 +1386,7 @@ function Show-LanZLogin {
             else {
                 $script:SuppressAutoLogin = $true
                 $autoRefreshToggle.IsChecked = $false
-                $updatedText.Text = '登录未完成，点击“重新登录”继续'
+                $updatedText.Text = '登录未完成，可在齿轮菜单中继续'
             }
         }).GetNewClosure())
 
@@ -812,7 +1394,6 @@ function Show-LanZLogin {
     }
     catch {
         $script:LoginWindowOpen = $false
-        $loginButton.Visibility = [Windows.Visibility]::Visible
         $updatedText.Text = $_.Exception.Message
         $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#F56C6C')
     }
@@ -820,32 +1401,115 @@ function Show-LanZLogin {
 
 function Update-Widget {
     try {
-        $models = Get-LanZModels
+        $sessionValue = Get-LanZSessionValue
+        $models = Get-LanZModels -SessionValue $sessionValue
+        $usageOverview = Get-LanZUsageOverview -SessionValue $sessionValue
+        $billingRules = Get-LanZBillingRules -SessionValue $sessionValue
         $modelsWithHistory = @(Add-LanZChartHistory -Models $models)
         $script:DisplayedModels = @(Sort-LanZModels -Models $modelsWithHistory)
         $modelsList.ItemsSource = $script:DisplayedModels
+        $usageCard.DataContext = New-LanZQuotaViewModel -Overview $usageOverview -BillingRules $billingRules
+        try {
+            Save-LanZStatusSnapshot -Models $models -Overview $usageOverview
+        }
+        catch {
+            # The live widget remains authoritative if local snapshot persistence fails.
+        }
         $updatedText.Text = '已更新 ' + (Get-Date).ToString('HH:mm:ss')
         $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
-        $loginButton.Visibility = [Windows.Visibility]::Collapsed
     }
     catch {
         $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#F56C6C')
         $updatedText.Text = $_.Exception.Message
         if ($_.Exception -is [System.UnauthorizedAccessException]) {
             $timer.Stop()
-            $loginButton.Visibility = [Windows.Visibility]::Visible
             if (-not $script:SuppressAutoLogin) {
                 Show-LanZLogin
             }
         }
     }
+    finally {
+        $sessionValue = $null
+    }
+}
+
+function Show-LanZCachedStatus {
+    if ($null -eq $script:CachedStatusSnapshot) {
+        return
+    }
+    try {
+        $snapshotTime = [DateTime]::Parse(
+            [string]$script:CachedStatusSnapshot.Timestamp,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        ).ToUniversalTime()
+        $cachedModels = @($script:CachedStatusSnapshot.Models | ForEach-Object {
+            [pscustomobject]@{
+                Name = [string]$_.Name
+                ModelId = [string]$_.ModelId
+                Active = [int]$_.Active
+                Capacity = [int]$_.Capacity
+                Percent = [int]$_.Percent
+                Available = [bool]$_.Available
+                Summary = [string]$_.Summary
+                Color = [string]$_.Color
+                CardBackground = [string]$_.CardBackground
+                CardBorder = [string]$_.CardBorder
+            }
+        })
+        $modelsWithHistory = @(Add-LanZChartHistory -Models $cachedModels -SampleTimestamp $snapshotTime -SkipPersistence)
+        $script:DisplayedModels = @(Sort-LanZModels -Models $modelsWithHistory)
+        $modelsList.ItemsSource = $script:DisplayedModels
+        $cachedRules = Import-LanZBillingRulesCache
+        $usageCard.DataContext = New-LanZQuotaViewModel -Overview $script:CachedStatusSnapshot.Usage -BillingRules $cachedRules
+        $localTime = $snapshotTime.ToLocalTime()
+        $updatedText.Text = '上次记录 ' + $localTime.ToString('MM-dd HH:mm:ss') + ' · 正在刷新…'
+        $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
+    }
+    catch {
+        $script:CachedStatusSnapshot = $null
+    }
+}
+
+function Update-LanZQuotaVisibility {
+    $externalVisible = [bool]$showExternalQuotaToggle.IsChecked
+    $internalVisible = [bool]$showInternalQuotaToggle.IsChecked
+    $externalQuotaRow.Visibility = if ($externalVisible) { [Windows.Visibility]::Visible } else { [Windows.Visibility]::Collapsed }
+    $internalQuotaRow.Visibility = if ($internalVisible) { [Windows.Visibility]::Visible } else { [Windows.Visibility]::Collapsed }
+    $externalQuotaRowDefinition.Height = [Windows.GridLength]::new($(if ($externalVisible) { 30 } else { 0 }))
+    $internalQuotaRowDefinition.Height = [Windows.GridLength]::new($(if ($internalVisible) { 30 } else { 0 }))
+    $visibleCount = [int]$externalVisible + [int]$internalVisible
+    $usageRowDefinition.Height = [Windows.GridLength]::new(78 + (30 * $visibleCount))
+}
+
+function Save-LanZUiPreferences {
+    $preferences = [ordered]@{
+        AutoRefresh = [bool]$autoRefreshToggle.IsChecked
+        ShowExternalQuota = [bool]$showExternalQuotaToggle.IsChecked
+        ShowInternalQuota = [bool]$showInternalQuotaToggle.IsChecked
+    }
+    [System.IO.File]::WriteAllText(
+        $script:UiPreferencesPath,
+        ($preferences | ConvertTo-Json -Compress),
+        [System.Text.UTF8Encoding]::new($false)
+    )
 }
 
 $timer = [Windows.Threading.DispatcherTimer]::new()
 $timer.Interval = [TimeSpan]::FromSeconds($RefreshSeconds)
 $timer.Add_Tick({ Update-Widget })
+$startupTimer = [Windows.Threading.DispatcherTimer]::new()
+$startupTimer.Interval = [TimeSpan]::FromMilliseconds(80)
+$startupTimer.Add_Tick({
+    $startupTimer.Stop()
+    Update-Widget
+    if ($autoRefreshToggle.IsChecked -and -not $script:LoginWindowOpen) {
+        $timer.Start()
+    }
+})
 $refreshButton.Add_Click({ Update-Widget })
 $autoRefreshToggle.Add_Checked({
+    Save-LanZUiPreferences
     $script:SuppressAutoLogin = $false
     Update-Widget
     if ($autoRefreshToggle.IsChecked -and -not $script:LoginWindowOpen) {
@@ -853,6 +1517,7 @@ $autoRefreshToggle.Add_Checked({
     }
 })
 $autoRefreshToggle.Add_Unchecked({
+    Save-LanZUiPreferences
     $timer.Stop()
     if (-not $script:LoginWindowOpen) {
         $updatedText.Text = '自动刷新已暂停'
@@ -860,9 +1525,17 @@ $autoRefreshToggle.Add_Unchecked({
     }
 })
 $loginButton.Add_Click({
+    $settingsPopup.IsOpen = $false
     $script:SuppressAutoLogin = $false
-    Show-LanZLogin
+    Show-LanZLogin -ClearExistingSession
 })
+$settingsButton.Add_Checked({ $settingsPopup.IsOpen = $true })
+$settingsButton.Add_Unchecked({ $settingsPopup.IsOpen = $false })
+$settingsPopup.Add_Closed({ $settingsButton.IsChecked = $false })
+$showExternalQuotaToggle.Add_Checked({ Update-LanZQuotaVisibility; Save-LanZUiPreferences })
+$showExternalQuotaToggle.Add_Unchecked({ Update-LanZQuotaVisibility; Save-LanZUiPreferences })
+$showInternalQuotaToggle.Add_Checked({ Update-LanZQuotaVisibility; Save-LanZUiPreferences })
+$showInternalQuotaToggle.Add_Unchecked({ Update-LanZQuotaVisibility; Save-LanZUiPreferences })
 $pinToggle.Add_Checked({
     $window.Topmost = $true
     $pinToggle.ToolTip = '已置顶，点击取消'
@@ -949,7 +1622,7 @@ $window.Add_PreviewMouseLeftButtonDown({
     }
 
     $position = $_.GetPosition($window)
-    if ($position.Y -gt 78) {
+    if ($position.Y -gt 70) {
         return
     }
 
@@ -974,23 +1647,31 @@ $window.Add_PreviewMouseLeftButtonDown({
     }
 })
 $window.Add_Loaded({
-    Update-Widget
-    if (-not [string]::IsNullOrWhiteSpace($ScreenshotPath)) {
+    Update-LanZQuotaVisibility
+    Show-LanZCachedStatus
+    if (-not [string]::IsNullOrWhiteSpace($ScreenshotPath) -or -not [string]::IsNullOrWhiteSpace($SettingsScreenshotPath)) {
+        Update-Widget
+        if (-not [string]::IsNullOrWhiteSpace($SettingsScreenshotPath)) {
+            $settingsButton.IsChecked = $true
+        }
         $screenshotTimer = [Windows.Threading.DispatcherTimer]::new()
         $screenshotTimer.Interval = [TimeSpan]::FromMilliseconds(500)
         $screenshotTimer.Add_Tick({
             $screenshotTimer.Stop()
-            Export-LanZWindowScreenshot -TargetWindow $window -Path $ScreenshotPath
+            if (-not [string]::IsNullOrWhiteSpace($ScreenshotPath)) {
+                Export-LanZWindowScreenshot -TargetWindow $window -Path $ScreenshotPath
+            }
+            if (-not [string]::IsNullOrWhiteSpace($SettingsScreenshotPath)) {
+                Export-LanZWindowScreenshot -TargetWindow $settingsPopup.Child -Path $SettingsScreenshotPath
+            }
             $window.Close()
         }.GetNewClosure())
         $screenshotTimer.Start()
         return
     }
-    if ($autoRefreshToggle.IsChecked -and -not $script:LoginWindowOpen) {
-        $timer.Start()
-    }
+    $startupTimer.Start()
 })
-$window.Add_Closed({ $timer.Stop() })
+$window.Add_Closed({ $startupTimer.Stop(); $timer.Stop() })
 
 [void]$window.ShowDialog()
 }

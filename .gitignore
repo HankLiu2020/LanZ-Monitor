@@ -2,6 +2,9 @@
 .lanz-config*
 .lanz-model-order.json
 .lanz-history.json
+.lanz-ui.json
+.lanz-billing-rules.json
+.lanz-status.jsonl
 .lanz-token-raw
 .analysis-app.js
 .tmp-webview2*
