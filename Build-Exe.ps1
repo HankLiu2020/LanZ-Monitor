@@ -1,6 +1,6 @@
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot 'dist'),
-    [string]$Version = '1.3.1.0'
+    [string]$Version = '1.3.2.0'
 )
 
 Set-StrictMode -Version Latest

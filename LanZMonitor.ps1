@@ -44,9 +44,9 @@ $script:CachedStatusSnapshot = $null
 $script:StatusLogWriteCount = 0
 $script:LastArchivedStatusTime = [DateTime]::MinValue
 $script:StatusRetentionDays = 30
-$script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $false; ShowInternalQuota = $true }
-$script:TimelineAges = @(18000.0, 3600.0, 1800.0, 900.0, 50.0, 40.0, 30.0, 20.0, 10.0, 0.0)
-$script:TimelineXs = @(0.0, 55.0, 105.0, 155.0, 218.0, 240.0, 262.0, 284.0, 307.0, 330.0)
+$script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $false; ShowInternalQuota = $true; ChartMode = 'bar' }
+$script:TimelineAges = @(18000.0, 3600.0, 1800.0, 900.0, 600.0, 300.0, 180.0, 120.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0, 0.0)
+$script:TimelineXs = @(0.0, 24.0, 52.0, 110.0, 130.0, 150.0, 170.0, 190.0, 210.0, 228.0, 250.0, 270.0, 290.0, 310.0, 330.0)
 $script:ModelOrderPath = Join-Path $script:SettingsDirectory 'model-order.json'
 $script:ModelOrder = [System.Collections.Generic.List[string]]::new()
 $script:DisplayedModels = @()
@@ -99,10 +99,13 @@ try {
                 $script:UiPreferences[$propertyName] = [bool]$savedUiPreferences.$propertyName
             }
         }
+        if ($null -ne $savedUiPreferences.PSObject.Properties['ChartMode'] -and [string]$savedUiPreferences.ChartMode -in @('bar', 'line')) {
+            $script:UiPreferences.ChartMode = [string]$savedUiPreferences.ChartMode
+        }
     }
 }
 catch {
-    $script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $false; ShowInternalQuota = $true }
+    $script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $false; ShowInternalQuota = $true; ChartMode = 'bar' }
 }
 
 Add-Type -AssemblyName System.Security
@@ -887,11 +890,59 @@ function Get-LanZTimelineX {
     return 330.0
 }
 
+function Get-LanZChartDisplaySamples {
+    param(
+        [Parameter(Mandatory)][array]$Samples,
+        [Parameter(Mandatory)][DateTime]$Now
+    )
+
+    $buckets = @{}
+    foreach ($sample in @($Samples | Sort-Object Timestamp)) {
+        $timestamp = ([DateTime]$sample.Timestamp).ToUniversalTime()
+        $ageSeconds = [math]::Max(0, ($Now - $timestamp).TotalSeconds)
+        $bucketSeconds = if ($ageSeconds -gt 3600) {
+            300
+        }
+        elseif ($ageSeconds -gt 1800) {
+            120
+        }
+        elseif ($ageSeconds -gt 900) {
+            60
+        }
+        elseif ($ageSeconds -gt 300) {
+            20
+        }
+        else {
+            10
+        }
+        $epochSeconds = ($timestamp - [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds
+        $bucketIndex = [math]::Floor($epochSeconds / $bucketSeconds)
+        $buckets["$bucketSeconds`:$bucketIndex"] = [pscustomobject]@{
+            Timestamp = $timestamp
+            Percent = [int]$sample.Percent
+        }
+    }
+    return @($buckets.Values | Sort-Object Timestamp)
+}
+
+function Get-LanZLoadColor {
+    param([Parameter(Mandatory)][int]$Percent)
+
+    if ($Percent -ge 85) {
+        return '#F56C6C'
+    }
+    if ($Percent -ge 60) {
+        return '#E6A23C'
+    }
+    return '#45C391'
+}
+
 function Add-LanZChartHistory {
     param(
         [Parameter(Mandatory)][array]$Models,
         [DateTime]$SampleTimestamp = [DateTime]::UtcNow,
-        [switch]$SkipPersistence
+        [switch]$SkipPersistence,
+        [switch]$SkipSample
     )
 
     $now = [DateTime]::UtcNow
@@ -908,7 +959,7 @@ function Add-LanZChartHistory {
 
         $history = $script:LoadHistory[$key]
         $lastSample = if ($history.Count -gt 0) { $history[$history.Count - 1] } else { $null }
-        if ($null -eq $lastSample -or [math]::Abs(($lastSample.Timestamp - $sampleTime).TotalSeconds) -gt 2) {
+        if (-not $SkipSample -and ($null -eq $lastSample -or [math]::Abs(($lastSample.Timestamp - $sampleTime).TotalSeconds) -gt 2)) {
             $history.Add([pscustomobject]@{
                 Timestamp = $sampleTime
                 Percent = [int]$model.Percent
@@ -918,10 +969,16 @@ function Add-LanZChartHistory {
             $history.RemoveAt(0)
         }
 
-        $samples = @($history | Sort-Object Timestamp)
+        $samples = @(Get-LanZChartDisplaySamples -Samples @($history) -Now $now)
         $values = @($samples | ForEach-Object { [int]$_.Percent })
-        $minimum = [int](($values | Measure-Object -Minimum).Minimum)
-        $maximum = [int](($values | Measure-Object -Maximum).Maximum)
+        if ($values.Count -eq 0) {
+            $minimum = 0
+            $maximum = 100
+        }
+        else {
+            $minimum = [int](($values | Measure-Object -Minimum).Minimum)
+            $maximum = [int](($values | Measure-Object -Maximum).Maximum)
+        }
         $lower = [math]::Max(0, $minimum - 2)
         $upper = [math]::Min(100, $maximum + 2)
 
@@ -942,10 +999,12 @@ function Add-LanZChartHistory {
         $range = [math]::Max(1, $upper - $lower)
         $plotHeight = 25.0
         $geometry = [Windows.Media.PathGeometry]::new()
+        $barSegments = [System.Collections.Generic.List[object]]::new()
         $previousTimestamp = $null
         $firstPoint = $null
         $lastPoint = $null
-        foreach ($sample in $samples) {
+        for ($sampleIndex = 0; $sampleIndex -lt $samples.Count; $sampleIndex++) {
+            $sample = $samples[$sampleIndex]
             $ageSeconds = [math]::Max(0, ($now - $sample.Timestamp).TotalSeconds)
             $x = Get-LanZTimelineX -AgeSeconds $ageSeconds
             $y = $plotHeight - (([double]$sample.Percent - $lower) / $range * $plotHeight)
@@ -966,6 +1025,32 @@ function Add-LanZChartHistory {
             }
             $previousTimestamp = $sample.Timestamp
             $lastPoint = $point
+
+            $nextX = if ($sampleIndex -lt ($samples.Count - 1)) {
+                $nextAge = [math]::Max(0, ($now - $samples[$sampleIndex + 1].Timestamp).TotalSeconds)
+                Get-LanZTimelineX -AgeSeconds $nextAge
+            }
+            else {
+                330.0
+            }
+            $barWidth = [math]::Max(1.0, [math]::Round($nextX - $x - 1.0, 2))
+            $gapSeconds = if ($sampleIndex -lt ($samples.Count - 1)) {
+                ($samples[$sampleIndex + 1].Timestamp - $sample.Timestamp).TotalSeconds
+            }
+            else {
+                10.0
+            }
+            $barColor = if ($gapSeconds -gt 30) { '#C8D4DC' } else { Get-LanZLoadColor -Percent ([int]$sample.Percent) }
+            $barOpacity = if ($gapSeconds -gt 30) { 0.45 } else { 0.92 }
+            $barHeight = [math]::Max(1.5, [math]::Round($plotHeight - $y, 2))
+            $barSegments.Add([pscustomobject]@{
+                X = [math]::Round($x + 0.5, 2)
+                Y = [math]::Round($plotHeight - $barHeight, 2)
+                Width = $barWidth
+                Height = $barHeight
+                Color = $barColor
+                Opacity = $barOpacity
+            })
         }
 
         $backfillPoints = [Windows.Media.PointCollection]::new()
@@ -973,16 +1058,46 @@ function Add-LanZChartHistory {
             [void]$backfillPoints.Add([Windows.Point]::new(0, $firstPoint.Y))
             [void]$backfillPoints.Add($firstPoint)
         }
+        if ($null -ne $firstPoint -and $firstPoint.X -gt 0.5) {
+            $barSegments.Insert(0, [pscustomobject]@{
+                X = 0.0
+                Y = $plotHeight - 2.0
+                Width = [math]::Round($firstPoint.X, 2)
+                Height = 2.0
+                Color = '#C8D4DC'
+                Opacity = 0.5
+            })
+        }
+        if ($barSegments.Count -eq 0) {
+            $barSegments.Add([pscustomobject]@{
+                X = 0.0
+                Y = $plotHeight - 2.0
+                Width = 330.0
+                Height = 2.0
+                Color = '#C8D4DC'
+                Opacity = 0.5
+            })
+        }
+
+        $lineVisibility = if ($script:UiPreferences.ChartMode -eq 'line') { [Windows.Visibility]::Visible } else { [Windows.Visibility]::Collapsed }
+        $barVisibility = if ($script:UiPreferences.ChartMode -eq 'bar') { [Windows.Visibility]::Visible } else { [Windows.Visibility]::Collapsed }
+        $currentPointVisibility = $lineVisibility
 
         $model | Add-Member -NotePropertyName ChartGeometry -NotePropertyValue $geometry -Force
         $model | Add-Member -NotePropertyName BackfillPoints -NotePropertyValue $backfillPoints -Force
+        $model | Add-Member -NotePropertyName BarSegments -NotePropertyValue @($barSegments) -Force
+        $model | Add-Member -NotePropertyName LineVisibility -NotePropertyValue $lineVisibility -Force
+        $model | Add-Member -NotePropertyName BarVisibility -NotePropertyValue $barVisibility -Force
+        $model | Add-Member -NotePropertyName CurrentPointVisibility -NotePropertyValue $currentPointVisibility -Force
         $model | Add-Member -NotePropertyName ChartUpperLabel -NotePropertyValue ("$upper%") -Force
         $model | Add-Member -NotePropertyName ChartLowerLabel -NotePropertyValue ("$lower%") -Force
-        $model | Add-Member -NotePropertyName CurrentX -NotePropertyValue ([math]::Max(0, $lastPoint.X - 3)) -Force
-        $model | Add-Member -NotePropertyName CurrentY -NotePropertyValue ([math]::Max(0, $lastPoint.Y - 3)) -Force
+        $currentX = if ($null -ne $lastPoint) { [math]::Max(0, $lastPoint.X - 3) } else { 327 }
+        $currentY = if ($null -ne $lastPoint) { [math]::Max(0, $lastPoint.Y - 3) } else { $plotHeight - 3 }
+        $model | Add-Member -NotePropertyName CurrentX -NotePropertyValue $currentX -Force
+        $model | Add-Member -NotePropertyName CurrentY -NotePropertyValue $currentY -Force
         $model | Add-Member -NotePropertyName CurrentMargin -NotePropertyValue ([Windows.Thickness]::new(
-            [math]::Max(0, $lastPoint.X - 3),
-            [math]::Max(0, $lastPoint.Y - 3),
+            $currentX,
+            $currentY,
             0,
             0
         )) -Force
@@ -1232,29 +1347,54 @@ function Export-LanZWindowScreenshot {
                                     <Canvas Width="330" Height="42" HorizontalAlignment="Left" VerticalAlignment="Center" ClipToBounds="True">
                                         <Line X1="0" Y1="27" X2="330" Y2="27" Stroke="#D8E1E7" StrokeThickness="1"/>
                                         <Line X1="0" Y1="27" X2="0" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
-                                        <Line X1="55" Y1="27" X2="55" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
-                                        <Line X1="105" Y1="27" X2="105" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
-                                        <Line X1="155" Y1="27" X2="155" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
-                                        <Line X1="218" Y1="27" X2="218" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
-                                        <Line X1="240" Y1="27" X2="240" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
-                                        <Line X1="262" Y1="27" X2="262" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
-                                        <Line X1="284" Y1="27" X2="284" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
-                                        <Line X1="307" Y1="27" X2="307" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="24" Y1="27" X2="24" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="52" Y1="27" X2="52" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="110" Y1="27" X2="110" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
+                                        <Line X1="130" Y1="27" X2="130" Y2="30" Stroke="#D3DDE3" StrokeThickness="1"/>
+                                        <Line X1="150" Y1="27" X2="150" Y2="30" Stroke="#D3DDE3" StrokeThickness="1"/>
+                                        <Line X1="170" Y1="27" X2="170" Y2="30" Stroke="#D3DDE3" StrokeThickness="1"/>
+                                        <Line X1="190" Y1="27" X2="190" Y2="30" Stroke="#D3DDE3" StrokeThickness="1"/>
+                                        <Line X1="210" Y1="27" X2="210" Y2="30" Stroke="#D3DDE3" StrokeThickness="1"/>
+                                        <Line X1="228" Y1="27" X2="228" Y2="30" Stroke="#D3DDE3" StrokeThickness="1"/>
+                                        <Line X1="250" Y1="27" X2="250" Y2="30" Stroke="#D3DDE3" StrokeThickness="1"/>
+                                        <Line X1="270" Y1="27" X2="270" Y2="30" Stroke="#D3DDE3" StrokeThickness="1"/>
+                                        <Line X1="290" Y1="27" X2="290" Y2="30" Stroke="#D3DDE3" StrokeThickness="1"/>
+                                        <Line X1="310" Y1="27" X2="310" Y2="30" Stroke="#D3DDE3" StrokeThickness="1"/>
                                         <Line X1="329" Y1="27" X2="329" Y2="30" Stroke="#B9C7D0" StrokeThickness="1"/>
                                         <TextBlock Text="5h" Canvas.Left="0" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
-                                        <TextBlock Text="1h" Canvas.Left="49" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
-                                        <TextBlock Text="30m" Canvas.Left="94" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
-                                        <TextBlock Text="15m" Canvas.Left="145" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
-                                        <TextBlock Text="50s" Canvas.Left="209" Canvas.Top="30" FontSize="7.5" Foreground="#87959F"/>
-                                        <TextBlock Text="40" Canvas.Left="235" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
-                                        <TextBlock Text="30" Canvas.Left="257" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
-                                        <TextBlock Text="20" Canvas.Left="279" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
-                                        <TextBlock Text="10" Canvas.Left="302" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="1h" Canvas.Left="18" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
+                                        <TextBlock Text="30m" Canvas.Left="41" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
+                                        <TextBlock Text="15m" Canvas.Left="101" Canvas.Top="30" FontSize="8" Foreground="#87959F"/>
+                                        <TextBlock Text="10m" Canvas.Left="122" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="5m" Canvas.Left="144" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="2m" Canvas.Left="165" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="1m" Canvas.Left="204" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="50s" Canvas.Left="219" Canvas.Top="30" FontSize="7.5" Foreground="#87959F"/>
+                                        <TextBlock Text="40" Canvas.Left="245" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="30" Canvas.Left="265" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="20" Canvas.Left="285" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
+                                        <TextBlock Text="10" Canvas.Left="305" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
                                         <TextBlock Text="0" Canvas.Left="324" Canvas.Top="30" FontSize="7.5" Foreground="#87959F"/>
-                                        <Polyline Points="{Binding BackfillPoints}" Stroke="{Binding Color}" StrokeThickness="1.6" StrokeDashArray="3,3" Opacity="0.3"/>
-                                        <Path Data="{Binding ChartGeometry}" Stroke="{Binding Color}" StrokeThickness="2.2" StrokeLineJoin="Round" Fill="Transparent"/>
+                                        <ItemsControl ItemsSource="{Binding BarSegments}" Visibility="{Binding BarVisibility}" Width="330" Height="27" Canvas.Left="0" Canvas.Top="0">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Canvas/></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemContainerStyle>
+                                                <Style TargetType="{x:Type ContentPresenter}">
+                                                    <Setter Property="Canvas.Left" Value="{Binding X}"/>
+                                                    <Setter Property="Canvas.Top" Value="{Binding Y}"/>
+                                                </Style>
+                                            </ItemsControl.ItemContainerStyle>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate>
+                                                    <Rectangle Width="{Binding Width}" Height="{Binding Height}" Fill="{Binding Color}" Opacity="{Binding Opacity}" RadiusX="1" RadiusY="1"/>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+                                        <Polyline Points="{Binding BackfillPoints}" Stroke="{Binding Color}" StrokeThickness="1.6" StrokeDashArray="3,3" Opacity="0.3" Visibility="{Binding LineVisibility}"/>
+                                        <Path Data="{Binding ChartGeometry}" Stroke="{Binding Color}" StrokeThickness="2.2" StrokeLineJoin="Round" Fill="Transparent" Visibility="{Binding LineVisibility}"/>
                                     </Canvas>
-                                    <Ellipse Width="6" Height="6" Fill="{Binding Color}" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="{Binding CurrentMargin}" IsHitTestVisible="False"/>
+                                    <Ellipse Width="6" Height="6" Fill="{Binding Color}" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="{Binding CurrentMargin}" Visibility="{Binding CurrentPointVisibility}" IsHitTestVisible="False"/>
                                     <TextBlock Text="{Binding ChartUpperLabel}" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,1,4,0" Padding="2,0" FontSize="8" Foreground="#84939E" Background="#CCF4F7F9"/>
                                     <TextBlock Text="{Binding ChartLowerLabel}" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,18,4,0" Padding="2,0" FontSize="8" Foreground="#84939E" Background="#CCF4F7F9"/>
                                 </Grid>
@@ -1272,6 +1412,11 @@ function Export-LanZWindowScreenshot {
                         <CheckBox x:Name="AutoRefreshToggle" Content="自动刷新（10 秒）" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
                         <CheckBox x:Name="ShowExternalQuotaToggle" Content="显示外网模型额度" IsChecked="False" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
                         <CheckBox x:Name="ShowInternalQuotaToggle" Content="显示内网模型额度" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
+                        <StackPanel Orientation="Horizontal" Margin="2,5,0,0">
+                            <TextBlock Text="图表模式" FontSize="11" Foreground="#536675" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <RadioButton x:Name="BarChartToggle" Content="柱状图" GroupName="ChartMode" IsChecked="True" FontSize="11" Foreground="#536675" Margin="0,0,9,0" Cursor="Hand"/>
+                            <RadioButton x:Name="LineChartToggle" Content="折线图" GroupName="ChartMode" IsChecked="False" FontSize="11" Foreground="#536675" Cursor="Hand"/>
+                        </StackPanel>
                         <Separator Margin="0,7,0,7" Background="#E7ECEF"/>
                         <Button x:Name="LoginButton" Content="重新登录 / 切换凭据" Height="29" FontSize="11" Foreground="#5A47E5" Background="#F0EEFF" BorderBrush="#D9D3FF" Cursor="Hand"/>
                     </StackPanel>
@@ -1300,12 +1445,16 @@ $dragArea = $window.FindName('DragArea')
 $autoRefreshToggle = $window.FindName('AutoRefreshToggle')
 $showExternalQuotaToggle = $window.FindName('ShowExternalQuotaToggle')
 $showInternalQuotaToggle = $window.FindName('ShowInternalQuotaToggle')
+$barChartToggle = $window.FindName('BarChartToggle')
+$lineChartToggle = $window.FindName('LineChartToggle')
 $settingsButton = $window.FindName('SettingsButton')
 $settingsPopup = $window.FindName('SettingsPopup')
 $loginButton = $window.FindName('LoginButton')
 $autoRefreshToggle.IsChecked = [bool]$script:UiPreferences.AutoRefresh
 $showExternalQuotaToggle.IsChecked = [bool]$script:UiPreferences.ShowExternalQuota
 $showInternalQuotaToggle.IsChecked = [bool]$script:UiPreferences.ShowInternalQuota
+$barChartToggle.IsChecked = $script:UiPreferences.ChartMode -eq 'bar'
+$lineChartToggle.IsChecked = $script:UiPreferences.ChartMode -eq 'line'
 
 function Show-LanZLogin {
     param([switch]$ClearExistingSession)
@@ -1379,7 +1528,9 @@ function Show-LanZLogin {
         $loginCloseButton = $loginWindow.FindName('LoginCloseButton')
         $webView = [Microsoft.Web.WebView2.Wpf.WebView2]::new()
         $creationProperties = [Microsoft.Web.WebView2.Wpf.CoreWebView2CreationProperties]::new()
-        $creationProperties.UserDataFolder = Join-Path $env:LOCALAPPDATA 'LanZMonitor\WebView2'
+        $webViewProfileDirectory = Join-Path $env:LOCALAPPDATA 'LanZMonitor\WebView2'
+        [void][IO.Directory]::CreateDirectory($webViewProfileDirectory)
+        $creationProperties.UserDataFolder = $webViewProfileDirectory
         $webView.CreationProperties = $creationProperties
         [void]$browserHost.Children.Add($webView)
 
@@ -1395,8 +1546,22 @@ function Show-LanZLogin {
         $loginTimer.Interval = [TimeSpan]::FromMilliseconds(250)
 
         $loginWindow.Add_Loaded(({
-            $loginState.EnsureTask = $webView.EnsureCoreWebView2Async()
-            $loginTimer.Start()
+            try {
+                $loginState.EnsureTask = $webView.EnsureCoreWebView2Async()
+                $loginTimer.Start()
+            }
+            catch {
+                $loginStatusText.Text = '验证窗口异常：' + $_.Exception.Message
+                $loginState.Stage = 'error'
+            }
+        }).GetNewClosure())
+
+        $webView.add_NavigationCompleted(({
+            param($sender, $eventArgs)
+            if (-not $eventArgs.IsSuccess) {
+                $loginStatusText.Text = '登录页面加载失败：' + [string]$eventArgs.WebErrorStatus
+                $loginState.Stage = 'error'
+            }
         }).GetNewClosure())
 
         $loginTimer.Add_Tick(({
@@ -1410,13 +1575,15 @@ function Show-LanZLogin {
                     }
                     $webView.CoreWebView2.Settings.AreDevToolsEnabled = $false
                     $webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = $false
+                    $webView.CoreWebView2.Settings.IsPasswordAutosaveEnabled = $true
+                    $webView.CoreWebView2.Settings.IsGeneralAutofillEnabled = $true
                     $webView.CoreWebView2.Profile.IsPasswordAutosaveEnabled = $true
                     $webView.CoreWebView2.Profile.IsGeneralAutofillEnabled = $true
                     if ($ClearExistingSession) {
                         $webView.CoreWebView2.CookieManager.DeleteAllCookies()
                     }
-                    $webView.Source = [Uri]$script:LoginUrl
-                    $loginStatusText.Text = '请完成登录；可选择保存密码，成功后会自动保存会话并关闭。'
+                    $webView.Source = [Uri]$script:UsageDashboardUrl
+                    $loginStatusText.Text = '请在资源看板完成登录；若页面提供保存密码提示可自行选择，程序只保存会话 Cookie。'
                     $loginState.Stage = 'cookies'
                     return
                 }
@@ -1451,7 +1618,7 @@ function Show-LanZLogin {
 
                 if ($null -eq $loginState.CookieTask -and ([DateTime]::UtcNow - $loginState.LastCookiePoll).TotalSeconds -ge 1) {
                     $loginState.LastCookiePoll = [DateTime]::UtcNow
-                    $loginState.CookieTask = $webView.CoreWebView2.CookieManager.GetCookiesAsync($script:LoginUrl)
+                    $loginState.CookieTask = $webView.CoreWebView2.CookieManager.GetCookiesAsync($script:UsageDashboardUrl)
                 }
             }
             catch {
@@ -1485,8 +1652,20 @@ function Show-LanZLogin {
     }
     catch {
         $script:LoginWindowOpen = $false
-        $updatedText.Text = $_.Exception.Message
+        $loginErrorMessage = '登录窗口启动失败：' + $_.Exception.Message
+        $updatedText.Text = $loginErrorMessage
         $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#F56C6C')
+        try {
+            [void][Windows.MessageBox]::Show(
+                $loginErrorMessage,
+                'LanZ 身份验证',
+                [Windows.MessageBoxButton]::OK,
+                [Windows.MessageBoxImage]::Error
+            )
+        }
+        catch {
+            # A message box is best-effort; the red status text remains visible if WPF is unavailable.
+        }
     }
 }
 
@@ -1677,11 +1856,27 @@ function Update-LanZQuotaVisibility {
     $usageRowDefinition.Height = [Windows.GridLength]::new(78 + (30 * $visibleCount))
 }
 
+function Update-LanZChartMode {
+    if ($barChartToggle.IsChecked) {
+        $script:UiPreferences.ChartMode = 'bar'
+    }
+    else {
+        $script:UiPreferences.ChartMode = 'line'
+    }
+
+    if ($script:DisplayedModels.Count -gt 0) {
+        [void](Add-LanZChartHistory -Models @($script:DisplayedModels) -SkipPersistence -SkipSample)
+        $modelsList.ItemsSource = $null
+        $modelsList.ItemsSource = $script:DisplayedModels
+    }
+}
+
 function Save-LanZUiPreferences {
     $preferences = [ordered]@{
         AutoRefresh = [bool]$autoRefreshToggle.IsChecked
         ShowExternalQuota = [bool]$showExternalQuotaToggle.IsChecked
         ShowInternalQuota = [bool]$showInternalQuotaToggle.IsChecked
+        ChartMode = [string]$script:UiPreferences.ChartMode
     }
     [System.IO.File]::WriteAllText(
         $script:UiPreferencesPath,
@@ -1725,7 +1920,7 @@ $autoRefreshToggle.Add_Unchecked({
 $loginButton.Add_Click({
     $settingsPopup.IsOpen = $false
     $script:SuppressAutoLogin = $false
-    Show-LanZLogin -ClearExistingSession
+    [void]$window.Dispatcher.BeginInvoke([Action]{ Show-LanZLogin -ClearExistingSession })
 })
 $settingsButton.Add_Checked({ $settingsPopup.IsOpen = $true })
 $settingsButton.Add_Unchecked({ $settingsPopup.IsOpen = $false })
@@ -1734,6 +1929,16 @@ $showExternalQuotaToggle.Add_Checked({ Update-LanZQuotaVisibility; Save-LanZUiPr
 $showExternalQuotaToggle.Add_Unchecked({ Update-LanZQuotaVisibility; Save-LanZUiPreferences })
 $showInternalQuotaToggle.Add_Checked({ Update-LanZQuotaVisibility; Save-LanZUiPreferences })
 $showInternalQuotaToggle.Add_Unchecked({ Update-LanZQuotaVisibility; Save-LanZUiPreferences })
+$barChartToggle.Add_Checked({
+    $script:UiPreferences.ChartMode = 'bar'
+    Save-LanZUiPreferences
+    Update-LanZChartMode
+})
+$lineChartToggle.Add_Checked({
+    $script:UiPreferences.ChartMode = 'line'
+    Save-LanZUiPreferences
+    Update-LanZChartMode
+})
 $pinToggle.Add_Checked({
     $window.Topmost = $true
     $pinToggle.ToolTip = '已置顶，点击取消'
