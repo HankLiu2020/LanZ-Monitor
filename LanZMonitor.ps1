@@ -45,6 +45,8 @@ $script:StatusLogWriteCount = 0
 $script:LastArchivedStatusTime = [DateTime]::MinValue
 $script:StatusRetentionDays = 30
 $script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $false; ShowInternalQuota = $true; ChartMode = 'bar' }
+$script:ChartWidth = 330.0
+$script:ChartPixelBucketWidth = 4.0
 $script:TimelineAges = @(18000.0, 3600.0, 1800.0, 900.0, 600.0, 300.0, 180.0, 120.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0, 0.0)
 $script:TimelineXs = @(0.0, 24.0, 52.0, 110.0, 130.0, 150.0, 170.0, 190.0, 210.0, 228.0, 250.0, 270.0, 290.0, 310.0, 330.0)
 $script:ModelOrderPath = Join-Path $script:SettingsDirectory 'model-order.json'
@@ -712,9 +714,26 @@ function Initialize-LanZHistory {
                         [Globalization.DateTimeStyles]::RoundtripKind
                     ).ToUniversalTime()
                 }
-                if ($timestamp -ge $cutoff) {
+                $endTimestamp = $timestamp
+                if ($null -ne $sample.PSObject.Properties['EndTimestamp'] -and -not [string]::IsNullOrWhiteSpace([string]$sample.EndTimestamp)) {
+                    $endTimestamp = if ($sample.EndTimestamp -is [DateTime]) {
+                        $sample.EndTimestamp.ToUniversalTime()
+                    }
+                    else {
+                        [DateTime]::Parse(
+                            [string]$sample.EndTimestamp,
+                            [Globalization.CultureInfo]::InvariantCulture,
+                            [Globalization.DateTimeStyles]::RoundtripKind
+                        ).ToUniversalTime()
+                    }
+                    if ($endTimestamp -lt $timestamp) {
+                        $endTimestamp = $timestamp
+                    }
+                }
+                if ($endTimestamp -ge $cutoff) {
                     $history.Add([pscustomobject]@{
                         Timestamp = $timestamp
+                        EndTimestamp = $endTimestamp
                         Percent = [int]$sample.Percent
                     })
                 }
@@ -854,10 +873,18 @@ function Save-LanZStatusSnapshot {
 
 function Save-LanZHistory {
     $payload = [ordered]@{}
+    $now = [DateTime]::UtcNow
     foreach ($key in @($script:LoadHistory.Keys)) {
-        $payload[$key] = @($script:LoadHistory[$key] | ForEach-Object {
+        $storedSamples = @(Get-LanZChartDisplaySamples -Samples @($script:LoadHistory[$key]) -Now $now)
+        $payload[$key] = @($storedSamples | ForEach-Object {
             [ordered]@{
                 Timestamp = $_.Timestamp.ToUniversalTime().ToString('o')
+                EndTimestamp = if ($null -ne $_.PSObject.Properties['EndTimestamp'] -and $_.EndTimestamp -is [DateTime]) {
+                    $_.EndTimestamp.ToUniversalTime().ToString('o')
+                }
+                else {
+                    $_.Timestamp.ToUniversalTime().ToString('o')
+                }
                 Percent = [int]$_.Percent
             }
         })
@@ -887,7 +914,7 @@ function Get-LanZTimelineX {
             return $script:TimelineXs[$index] + ($progress * ($script:TimelineXs[$index + 1] - $script:TimelineXs[$index]))
         }
     }
-    return 330.0
+    return $script:ChartWidth
 }
 
 function Get-LanZChartDisplaySamples {
@@ -896,33 +923,69 @@ function Get-LanZChartDisplaySamples {
         [Parameter(Mandatory)][DateTime]$Now
     )
 
+    # The chart is 330 px wide. Keep at most one representative segment per
+    # four pixels, similar to the pixel-aware decimation used by common JS
+    # chart libraries. The first timestamp positions the segment; EndTimestamp
+    # preserves the covered raw interval so a compacted bucket is not mistaken
+    # for a data gap after a restart.
+    $pixelBucketWidth = $script:ChartPixelBucketWidth
+    $maxBucketIndex = [int][math]::Ceiling($script:ChartWidth / $pixelBucketWidth) - 1
     $buckets = @{}
     foreach ($sample in @($Samples | Sort-Object Timestamp)) {
         $timestamp = ([DateTime]$sample.Timestamp).ToUniversalTime()
         $ageSeconds = [math]::Max(0, ($Now - $timestamp).TotalSeconds)
-        $bucketSeconds = if ($ageSeconds -gt 3600) {
-            300
+        $x = [double](Get-LanZTimelineX -AgeSeconds $ageSeconds)
+        $bucketIndex = [int][math]::Floor($x / $pixelBucketWidth)
+        if ($bucketIndex -lt 0) {
+            $bucketIndex = 0
         }
-        elseif ($ageSeconds -gt 1800) {
-            120
+        elseif ($bucketIndex -gt $maxBucketIndex) {
+            $bucketIndex = $maxBucketIndex
         }
-        elseif ($ageSeconds -gt 900) {
-            60
+        $endTimestamp = if ($null -ne $sample.PSObject.Properties['EndTimestamp'] -and $sample.EndTimestamp -is [DateTime]) {
+            $sample.EndTimestamp.ToUniversalTime()
         }
-        elseif ($ageSeconds -gt 300) {
-            20
+        elseif ($null -ne $sample.PSObject.Properties['EndTimestamp'] -and -not [string]::IsNullOrWhiteSpace([string]$sample.EndTimestamp)) {
+            [DateTime]::Parse(
+                [string]$sample.EndTimestamp,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            ).ToUniversalTime()
         }
         else {
-            10
+            $timestamp
         }
-        $epochSeconds = ($timestamp - [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds
-        $bucketIndex = [math]::Floor($epochSeconds / $bucketSeconds)
-        $buckets["$bucketSeconds`:$bucketIndex"] = [pscustomobject]@{
-            Timestamp = $timestamp
-            Percent = [int]$sample.Percent
+        if ($endTimestamp -lt $timestamp) {
+            $endTimestamp = $timestamp
+        }
+
+        if (-not $buckets.ContainsKey($bucketIndex)) {
+            $buckets[$bucketIndex] = [pscustomobject]@{
+                Timestamp = $timestamp
+                EndTimestamp = $endTimestamp
+                Percent = [int]$sample.Percent
+            }
+        }
+        else {
+            $bucket = $buckets[$bucketIndex]
+            if ($endTimestamp -gt $bucket.EndTimestamp) {
+                $bucket.EndTimestamp = $endTimestamp
+            }
+            if ([int]$sample.Percent -gt [int]$bucket.Percent) {
+                $bucket.Percent = [int]$sample.Percent
+            }
         }
     }
-    return @($buckets.Values | Sort-Object Timestamp)
+
+    $displaySamples = @($buckets.Values | Sort-Object Timestamp)
+    for ($index = 0; $index -lt $displaySamples.Count; $index++) {
+        $gapAfterSeconds = 10.0
+        if ($index -lt ($displaySamples.Count - 1)) {
+            $gapAfterSeconds = [math]::Max(0, ($displaySamples[$index + 1].Timestamp - $displaySamples[$index].EndTimestamp).TotalSeconds)
+        }
+        $displaySamples[$index] | Add-Member -NotePropertyName GapAfterSeconds -NotePropertyValue $gapAfterSeconds -Force
+    }
+    return $displaySamples
 }
 
 function Get-LanZLoadColor {
@@ -962,10 +1025,20 @@ function Add-LanZChartHistory {
         if (-not $SkipSample -and ($null -eq $lastSample -or [math]::Abs(($lastSample.Timestamp - $sampleTime).TotalSeconds) -gt 2)) {
             $history.Add([pscustomobject]@{
                 Timestamp = $sampleTime
+                EndTimestamp = $sampleTime
                 Percent = [int]$model.Percent
             })
         }
-        while ($history.Count -gt 0 -and $history[0].Timestamp -lt $cutoff) {
+        while ($history.Count -gt 0) {
+            $oldestEndTimestamp = if ($null -ne $history[0].PSObject.Properties['EndTimestamp']) {
+                $history[0].EndTimestamp
+            }
+            else {
+                $history[0].Timestamp
+            }
+            if ($oldestEndTimestamp -ge $cutoff) {
+                break
+            }
             $history.RemoveAt(0)
         }
 
@@ -1013,7 +1086,16 @@ function Add-LanZChartHistory {
                 $firstPoint = $point
             }
 
-            if ($null -eq $previousTimestamp -or ($sample.Timestamp - $previousTimestamp).TotalSeconds -gt 30) {
+            $gapBeforeSeconds = if ($sampleIndex -eq 0) {
+                0.0
+            }
+            elseif ($null -ne $samples[$sampleIndex - 1].PSObject.Properties['GapAfterSeconds']) {
+                [double]$samples[$sampleIndex - 1].GapAfterSeconds
+            }
+            else {
+                ($sample.Timestamp - $samples[$sampleIndex - 1].Timestamp).TotalSeconds
+            }
+            if ($null -eq $previousTimestamp -or $gapBeforeSeconds -gt 30) {
                 $figure = [Windows.Media.PathFigure]::new()
                 $figure.StartPoint = $point
                 $figure.IsClosed = $false
@@ -1026,22 +1108,26 @@ function Add-LanZChartHistory {
             $previousTimestamp = $sample.Timestamp
             $lastPoint = $point
 
-            $nextX = if ($sampleIndex -lt ($samples.Count - 1)) {
-                $nextAge = [math]::Max(0, ($now - $samples[$sampleIndex + 1].Timestamp).TotalSeconds)
-                Get-LanZTimelineX -AgeSeconds $nextAge
+            $gapAfterSeconds = if ($null -ne $sample.PSObject.Properties['GapAfterSeconds']) {
+                [double]$sample.GapAfterSeconds
             }
-            else {
-                330.0
-            }
-            $barWidth = [math]::Max(1.0, [math]::Round($nextX - $x - 1.0, 2))
-            $gapSeconds = if ($sampleIndex -lt ($samples.Count - 1)) {
+            elseif ($sampleIndex -lt ($samples.Count - 1)) {
                 ($samples[$sampleIndex + 1].Timestamp - $sample.Timestamp).TotalSeconds
             }
             else {
                 10.0
             }
-            $barColor = if ($gapSeconds -gt 30) { '#C8D4DC' } else { Get-LanZLoadColor -Percent ([int]$sample.Percent) }
-            $barOpacity = if ($gapSeconds -gt 30) { 0.45 } else { 0.92 }
+
+            $nextX = if ($sampleIndex -lt ($samples.Count - 1)) {
+                $nextAge = [math]::Max(0, ($now - $samples[$sampleIndex + 1].Timestamp).TotalSeconds)
+                Get-LanZTimelineX -AgeSeconds $nextAge
+            }
+            else {
+                $script:ChartWidth
+            }
+            $barWidth = [math]::Max(1.0, [math]::Round($nextX - $x - 1.0, 2))
+            $barColor = if ($gapAfterSeconds -gt 30) { '#C8D4DC' } else { Get-LanZLoadColor -Percent ([int]$sample.Percent) }
+            $barOpacity = if ($gapAfterSeconds -gt 30) { 0.45 } else { 0.92 }
             $barHeight = [math]::Max(1.5, [math]::Round($plotHeight - $y, 2))
             $barSegments.Add([pscustomobject]@{
                 X = [math]::Round($x + 0.5, 2)
@@ -1072,7 +1158,7 @@ function Add-LanZChartHistory {
             $barSegments.Add([pscustomobject]@{
                 X = 0.0
                 Y = $plotHeight - 2.0
-                Width = 330.0
+                Width = $script:ChartWidth
                 Height = 2.0
                 Color = '#C8D4DC'
                 Opacity = 0.5
@@ -1369,12 +1455,12 @@ function Export-LanZWindowScreenshot {
                                         <TextBlock Text="5m" Canvas.Left="144" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
                                         <TextBlock Text="2m" Canvas.Left="165" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
                                         <TextBlock Text="1m" Canvas.Left="204" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
-                                        <TextBlock Text="50s" Canvas.Left="219" Canvas.Top="30" FontSize="7.5" Foreground="#87959F"/>
+                                        <TextBlock Text="50" Canvas.Left="219" Canvas.Top="30" FontSize="7.5" Foreground="#87959F"/>
                                         <TextBlock Text="40" Canvas.Left="245" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
                                         <TextBlock Text="30" Canvas.Left="265" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
                                         <TextBlock Text="20" Canvas.Left="285" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
                                         <TextBlock Text="10" Canvas.Left="305" Canvas.Top="30" FontSize="7.5" Foreground="#9AA6AE"/>
-                                        <TextBlock Text="0" Canvas.Left="324" Canvas.Top="30" FontSize="7.5" Foreground="#87959F"/>
+                                        <TextBlock Text="0s" Canvas.Left="322" Canvas.Top="30" FontSize="7.5" Foreground="#87959F"/>
                                         <ItemsControl ItemsSource="{Binding BarSegments}" Visibility="{Binding BarVisibility}" Width="330" Height="27" Canvas.Left="0" Canvas.Top="0">
                                             <ItemsControl.ItemsPanel>
                                                 <ItemsPanelTemplate><Canvas/></ItemsPanelTemplate>
