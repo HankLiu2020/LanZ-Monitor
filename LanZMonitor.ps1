@@ -1554,6 +1554,11 @@ function Show-LanZLogin {
     $timer.Stop()
 
     try {
+        $loginNavigationUri = $null
+        if (-not [Uri]::TryCreate([string]$script:UsageDashboardUrl, [UriKind]::Absolute, [ref]$loginNavigationUri) -or $loginNavigationUri.Scheme -ne 'https') {
+            throw '资源看板地址无效，请重新配置连接信息。'
+        }
+
         $webViewDirectory = Join-Path $script:RuntimeDirectory 'WebView2'
         $runtimeFilesReady = @(
             'Microsoft.Web.WebView2.Core.dll',
@@ -1624,6 +1629,7 @@ function Show-LanZLogin {
             Stage = 'ensure'
             EnsureTask = $null
             CookieTask = $null
+            NavigationUri = $loginNavigationUri.AbsoluteUri
             LastCandidate = ''
             LastCookiePoll = [DateTime]::MinValue
             Success = $false
@@ -1668,7 +1674,7 @@ function Show-LanZLogin {
                     if ($ClearExistingSession) {
                         $webView.CoreWebView2.CookieManager.DeleteAllCookies()
                     }
-                    $webView.Source = [Uri]$script:UsageDashboardUrl
+                    $webView.CoreWebView2.Navigate($loginState.NavigationUri)
                     $loginStatusText.Text = '请在资源看板完成登录；若页面提供保存密码提示可自行选择，程序只保存会话 Cookie。'
                     $loginState.Stage = 'cookies'
                     return
@@ -1704,7 +1710,7 @@ function Show-LanZLogin {
 
                 if ($null -eq $loginState.CookieTask -and ([DateTime]::UtcNow - $loginState.LastCookiePoll).TotalSeconds -ge 1) {
                     $loginState.LastCookiePoll = [DateTime]::UtcNow
-                    $loginState.CookieTask = $webView.CoreWebView2.CookieManager.GetCookiesAsync($script:UsageDashboardUrl)
+                    $loginState.CookieTask = $webView.CoreWebView2.CookieManager.GetCookiesAsync($loginState.NavigationUri)
                 }
             }
             catch {

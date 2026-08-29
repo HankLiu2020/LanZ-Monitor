@@ -31,11 +31,11 @@
 
 ### Windows EXE 版
 
-1. 从 GitHub Releases 下载 `LanZ-Monitor-win-x64.zip` 并解压。
-2. 先运行 `LanZ-Setup.exe`，完成连接参数和会话值的本地加密配置。
+1. 从 GitHub Releases 下载 `LanZ-Monitor.exe`。
+2. 首次使用且本机还没有连接配置时，从仓库下载 `Set-LanZSession.ps1` 和 `setup-session.cmd`，在脚本同目录双击 `setup-session.cmd` 完成一次性配置。
 3. 运行 `LanZ-Monitor.exe`。之后可从齿轮菜单选择“重新登录”，无需重新输入连接参数。
 
-EXE 版不需要另外安装 PowerShell 7，但仍需要 Windows 10/11 自带的 Windows PowerShell 5.1 与 Microsoft Edge WebView2 Runtime。WebView2 SDK 依赖会由主程序自动释放到 `%LOCALAPPDATA%\LanZ-Monitor\runtime\WebView2`。发布包不包含服务地址、Cookie、Token、密钥或密码；这些内容只会在首次配置时写入当前用户的 DPAPI 加密文件。
+EXE 版运行监控器不需要另外安装 PowerShell 7；首次配置脚本使用 Windows 10/11 自带的 Windows PowerShell 5.1。GitHub Release 只附加 `LanZ-Monitor.exe`，不再发布容易造成误解的 `LanZ-Setup.exe`、压缩包或文档附件；配置脚本仍保留在仓库中作为一次性配置入口。交互式身份验证只负责在资源看板中登录并更新会话 Cookie，不能替代未知的 API 地址、字段和加密参数配置。WebView2 SDK 依赖会由主程序自动释放到 `%LOCALAPPDATA%\LanZ-Monitor\runtime\WebView2`。发布文件不包含服务地址、Cookie、Token、密钥或密码；这些内容只会在首次配置时写入当前用户的 DPAPI 加密文件。
 
 GitHub 发布的 EXE 目前未使用商业代码签名证书签名，Windows 可能在首次启动时显示 SmartScreen 提示。可对照 Release 页面的 SHA-256 校验值确认文件完整性。
 

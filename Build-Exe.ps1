@@ -1,6 +1,6 @@
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot 'dist'),
-    [string]$Version = '1.3.3.0'
+    [string]$Version = '1.3.4.0'
 )
 
 Set-StrictMode -Version Latest
@@ -71,7 +71,10 @@ foreach ($sourcePath in $embeddedFiles.Values) {
 }
 
 $monitorOutput = Join-Path $OutputDirectory 'LanZ-Monitor.exe'
-$setupOutput = Join-Path $OutputDirectory 'LanZ-Setup.exe'
+$obsoleteSetupOutput = Join-Path $OutputDirectory 'LanZ-Setup.exe'
+if (Test-Path -LiteralPath $obsoleteSetupOutput) {
+    Remove-Item -LiteralPath $obsoleteSetupOutput -Force
+}
 
 Invoke-PS2EXE -InputFile (Join-Path $projectDirectory 'LanZMonitor.ps1') `
     -OutputFile $monitorOutput `
@@ -90,27 +93,19 @@ Invoke-PS2EXE -InputFile (Join-Path $projectDirectory 'LanZMonitor.ps1') `
     -DPIAware `
     -SupportOS
 
-Invoke-PS2EXE -InputFile (Join-Path $projectDirectory 'Set-LanZSession.ps1') `
-    -OutputFile $setupOutput `
-    -IconFile $iconPath `
-    -Title 'LanZ Monitor Setup' `
-    -Product 'LanZ Monitor' `
-    -Description '本地加密连接配置工具' `
-    -Company 'LanZ Monitor Contributors' `
-    -Copyright 'MIT License' `
-    -Version $Version `
-    -X64 `
-    -SupportOS
-
-Copy-Item -LiteralPath (Join-Path $projectDirectory 'README.md') -Destination (Join-Path $OutputDirectory 'README.md') -Force
-Copy-Item -LiteralPath (Join-Path $projectDirectory 'LICENSE') -Destination (Join-Path $OutputDirectory 'LICENSE') -Force
+$readmeOutput = Join-Path $OutputDirectory 'README.md'
+$licenseOutput = Join-Path $OutputDirectory 'LICENSE'
+$sessionScriptOutput = Join-Path $OutputDirectory 'Set-LanZSession.ps1'
+$setupCommandOutput = Join-Path $OutputDirectory 'setup-session.cmd'
+$startCommandOutput = Join-Path $OutputDirectory 'start-widget.cmd'
+Copy-Item -LiteralPath (Join-Path $projectDirectory 'README.md') -Destination $readmeOutput -Force
+Copy-Item -LiteralPath (Join-Path $projectDirectory 'LICENSE') -Destination $licenseOutput -Force
+Copy-Item -LiteralPath (Join-Path $projectDirectory 'Set-LanZSession.ps1') -Destination $sessionScriptOutput -Force
+Copy-Item -LiteralPath (Join-Path $projectDirectory 'setup-session.cmd') -Destination $setupCommandOutput -Force
+Copy-Item -LiteralPath (Join-Path $projectDirectory 'start-widget.cmd') -Destination $startCommandOutput -Force
 
 $zipPath = Join-Path $OutputDirectory 'LanZ-Monitor-win-x64.zip'
-Compress-Archive -LiteralPath @(
-    $monitorOutput,
-    $setupOutput,
-    (Join-Path $OutputDirectory 'README.md'),
-    (Join-Path $OutputDirectory 'LICENSE')
-) -DestinationPath $zipPath -Force
+$packageFiles = $monitorOutput, $readmeOutput, $licenseOutput, $sessionScriptOutput, $setupCommandOutput, $startCommandOutput
+Compress-Archive -LiteralPath $packageFiles -DestinationPath $zipPath -Force
 
-Get-Item -LiteralPath $monitorOutput, $setupOutput, $zipPath | Select-Object Name, Length, LastWriteTime
+Get-Item -LiteralPath $monitorOutput, $zipPath | Select-Object Name, Length, LastWriteTime
