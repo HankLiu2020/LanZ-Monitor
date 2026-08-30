@@ -1,6 +1,6 @@
-param(
+﻿param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot 'dist'),
-    [string]$Version = '1.3.4.0'
+    [string]$Version = '1.4.0.0'
 )
 
 Set-StrictMode -Version Latest
@@ -23,6 +23,18 @@ $buildDirectory = Join-Path $projectDirectory '.build'
 
 $iconPath = Join-Path $buildDirectory 'LanZ-Monitor.ico'
 Add-Type -AssemblyName System.Drawing
+if (-not ('LanZMonitor.NativeIconMethods' -as [type])) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+namespace LanZMonitor {
+    public static class NativeIconMethods {
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool DestroyIcon(IntPtr handle);
+    }
+}
+'@
+}
 $bitmap = [Drawing.Bitmap]::new(64, 64)
 $graphics = [Drawing.Graphics]::FromImage($bitmap)
 try {
@@ -43,7 +55,8 @@ try {
         $backgroundBrush.Dispose()
         $linePen.Dispose()
     }
-    $icon = [Drawing.Icon]::FromHandle($bitmap.GetHicon())
+    $iconHandle = $bitmap.GetHicon()
+    $icon = [Drawing.Icon]::FromHandle($iconHandle)
     $stream = [IO.File]::Create($iconPath)
     try {
         $icon.Save($stream)
@@ -51,6 +64,7 @@ try {
     finally {
         $stream.Dispose()
         $icon.Dispose()
+        [void][LanZMonitor.NativeIconMethods]::DestroyIcon($iconHandle)
     }
 }
 finally {
@@ -60,9 +74,9 @@ finally {
 
 $webViewDirectory = Join-Path $projectDirectory 'lib\WebView2'
 $embeddedFiles = @{
-    '%LOCALAPPDATA%\LanZ-Monitor\runtime\WebView2\Microsoft.Web.WebView2.Core.dll' = (Join-Path $webViewDirectory 'Microsoft.Web.WebView2.Core.dll')
-    '%LOCALAPPDATA%\LanZ-Monitor\runtime\WebView2\Microsoft.Web.WebView2.Wpf.dll' = (Join-Path $webViewDirectory 'Microsoft.Web.WebView2.Wpf.dll')
-    '%LOCALAPPDATA%\LanZ-Monitor\runtime\WebView2\WebView2Loader.dll' = (Join-Path $webViewDirectory 'WebView2Loader.dll')
+    '%LOCALAPPDATA%\LanZ-Monitor\runtime\WebView2Payload\Microsoft.Web.WebView2.Core.dll' = (Join-Path $webViewDirectory 'Microsoft.Web.WebView2.Core.dll')
+    '%LOCALAPPDATA%\LanZ-Monitor\runtime\WebView2Payload\Microsoft.Web.WebView2.Wpf.dll' = (Join-Path $webViewDirectory 'Microsoft.Web.WebView2.Wpf.dll')
+    '%LOCALAPPDATA%\LanZ-Monitor\runtime\WebView2Payload\WebView2Loader.dll' = (Join-Path $webViewDirectory 'WebView2Loader.dll')
 }
 foreach ($sourcePath in $embeddedFiles.Values) {
     if (-not (Test-Path -LiteralPath $sourcePath)) {
@@ -93,19 +107,21 @@ Invoke-PS2EXE -InputFile (Join-Path $projectDirectory 'LanZMonitor.ps1') `
     -DPIAware `
     -SupportOS
 
-$readmeOutput = Join-Path $OutputDirectory 'README.md'
-$licenseOutput = Join-Path $OutputDirectory 'LICENSE'
-$sessionScriptOutput = Join-Path $OutputDirectory 'Set-LanZSession.ps1'
-$setupCommandOutput = Join-Path $OutputDirectory 'setup-session.cmd'
-$startCommandOutput = Join-Path $OutputDirectory 'start-widget.cmd'
-Copy-Item -LiteralPath (Join-Path $projectDirectory 'README.md') -Destination $readmeOutput -Force
-Copy-Item -LiteralPath (Join-Path $projectDirectory 'LICENSE') -Destination $licenseOutput -Force
-Copy-Item -LiteralPath (Join-Path $projectDirectory 'Set-LanZSession.ps1') -Destination $sessionScriptOutput -Force
-Copy-Item -LiteralPath (Join-Path $projectDirectory 'setup-session.cmd') -Destination $setupCommandOutput -Force
-Copy-Item -LiteralPath (Join-Path $projectDirectory 'start-widget.cmd') -Destination $startCommandOutput -Force
+# 发布目录只保留单文件 EXE；登录已内建到程序，不再发布
+# setup 脚本、README/LICENSE 副本或 zip 包。
+$obsoletePackageOutputs = @(
+    'LanZ-Monitor-win-x64.zip',
+    'README.md',
+    'LICENSE',
+    'Set-LanZSession.ps1',
+    'setup-session.cmd',
+    'start-widget.cmd'
+)
+foreach ($obsoleteName in $obsoletePackageOutputs) {
+    $obsoletePath = Join-Path $OutputDirectory $obsoleteName
+    if (Test-Path -LiteralPath $obsoletePath) {
+        Remove-Item -LiteralPath $obsoletePath -Force
+    }
+}
 
-$zipPath = Join-Path $OutputDirectory 'LanZ-Monitor-win-x64.zip'
-$packageFiles = $monitorOutput, $readmeOutput, $licenseOutput, $sessionScriptOutput, $setupCommandOutput, $startCommandOutput
-Compress-Archive -LiteralPath $packageFiles -DestinationPath $zipPath -Force
-
-Get-Item -LiteralPath $monitorOutput, $zipPath | Select-Object Name, Length, LastWriteTime
+Get-Item -LiteralPath $monitorOutput | Select-Object Name, Length, LastWriteTime

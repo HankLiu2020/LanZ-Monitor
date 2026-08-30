@@ -3,7 +3,7 @@
     [string]$ScreenshotPath,
     [string]$SettingsScreenshotPath,
     [ValidateRange(2, 60)]
-    [int]$RefreshSeconds = 10
+    [int]$RefreshSeconds = 3
 )
 
 Set-StrictMode -Version Latest
@@ -37,9 +37,19 @@ $script:LoadHistory = @{}
 $script:HistoryPath = Join-Path $script:DataDirectory 'chart-history.json'
 $script:LatestStatusPath = Join-Path $script:DataDirectory 'latest-status.json'
 $script:StatusLogPath = Join-Path $script:DataDirectory 'load-history.jsonl'
+$script:LoginDiagLog = Join-Path $script:DataDirectory 'login-diag.log'
+$script:BrowserDiagLog = Join-Path $script:DataDirectory 'browser-diag.log'
 $script:UiPreferencesPath = Join-Path $script:SettingsDirectory 'ui.json'
 $script:BillingRulesPath = Join-Path $script:SettingsDirectory 'billing-rules.json'
+$script:BillingOverridesPath = Join-Path $script:SettingsDirectory 'billing-overrides.json'
+$script:CadencePath = Join-Path $script:SettingsDirectory 'refresh-cadence.json'
 $script:BillingRules = $null
+# 用量与规则的低频刷新间隔(秒)。模型负载以 WebView2 看板响应为主，
+# 当日用量两分钟一次、积分规则四小时一次，避免高频直连调用。
+$script:UsageRefreshSeconds = 120
+$script:BillingRefreshSeconds = 14400
+$script:LastUsageFetchUtc = [DateTime]::MinValue
+$script:LastBillingFetchUtc = [DateTime]::MinValue
 $script:CachedStatusSnapshot = $null
 $script:StatusLogWriteCount = 0
 $script:LastArchivedStatusTime = [DateTime]::MinValue
@@ -51,11 +61,38 @@ $script:TimelineAges = @(18000.0, 3600.0, 1800.0, 900.0, 600.0, 300.0, 180.0, 12
 $script:TimelineXs = @(0.0, 24.0, 52.0, 110.0, 130.0, 150.0, 170.0, 190.0, 210.0, 228.0, 250.0, 270.0, 290.0, 310.0, 330.0)
 $script:ModelOrderPath = Join-Path $script:SettingsDirectory 'model-order.json'
 $script:ModelOrder = [System.Collections.Generic.List[string]]::new()
+$script:ModelOrderSchemaVersion = 2
+$script:ModelOrderUserDefined = $false
+$script:ModelOrderNeedsSave = $false
+$script:DefaultModelOrderHints = @(
+    'a-lanz-code-auto',
+    'a-lanz-code-medium',
+    'a-lanz-code-qwen36-27b'
+)
 $script:DisplayedModels = @()
 $script:DragStartPoint = $null
 $script:DragModelId = $null
 $script:RefreshInProgress = $false
 $script:RefreshWorker = $null
+$script:LastSuccessfulModelRefreshUtc = [DateTime]::MinValue
+$script:BrowserReloadSeconds = 15
+$script:BrowserCaptureWindow = $null
+$script:BrowserView = $null
+$script:BrowserCaptureState = $null
+$script:BrowserCaptureTimer = $null
+$script:BrowserResponseQueue = [System.Collections.Generic.List[object]]::new()
+$script:BrowserModels = $null
+$script:BrowserActualModelMap = @{}
+$script:BrowserUsage = $null
+$script:BrowserLastModelsUtc = [DateTime]::MinValue
+$script:BrowserLastUsageUtc = [DateTime]::MinValue
+$script:ExitRequested = $false
+$script:TrayIcon = $null
+$script:TrayContextMenu = $null
+$script:TrayPinMenu = $null
+$script:TrayOwnedIcon = $null
+$script:SharedHttpHandler = $null
+$script:SharedHttpClient = $null
 
 $legacyStateFiles = [ordered]@{
     '.lanz-session.bin' = $script:SessionPath
@@ -82,9 +119,26 @@ foreach ($legacyName in $legacyStateFiles.Keys) {
 
 try {
     if (Test-Path -LiteralPath $script:ModelOrderPath) {
-        foreach ($modelId in @(Get-Content -LiteralPath $script:ModelOrderPath -Raw | ConvertFrom-Json)) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$modelId) -and -not $script:ModelOrder.Contains([string]$modelId)) {
-                $script:ModelOrder.Add([string]$modelId)
+        $savedModelOrder = Get-Content -LiteralPath $script:ModelOrderPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        # v1 used a bare JSON array and could preserve malformed drag payloads. Treat it as
+        # a legacy default so this release can establish the requested Auto/Medium/Flash
+        # order once. v2 is explicit and remains user-controlled after any drag operation.
+        if ($null -ne $savedModelOrder.PSObject.Properties['Version'] -and
+            [int]$savedModelOrder.Version -ge $script:ModelOrderSchemaVersion -and
+            $null -ne $savedModelOrder.PSObject.Properties['Order']) {
+            if ($null -ne $savedModelOrder.PSObject.Properties['UserDefined']) {
+                $script:ModelOrderUserDefined = [bool]$savedModelOrder.UserDefined
+            }
+            else {
+                $script:ModelOrderNeedsSave = $true
+            }
+            $seenModelIds = @{}
+            foreach ($modelIdValue in @($savedModelOrder.Order)) {
+                $modelId = [string]$modelIdValue
+                if ($modelId -match '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$' -and -not $seenModelIds.ContainsKey($modelId)) {
+                    $script:ModelOrder.Add($modelId)
+                    $seenModelIds[$modelId] = $true
+                }
             }
         }
     }
@@ -95,7 +149,7 @@ catch {
 
 try {
     if (Test-Path -LiteralPath $script:UiPreferencesPath) {
-        $savedUiPreferences = Get-Content -LiteralPath $script:UiPreferencesPath -Raw | ConvertFrom-Json
+        $savedUiPreferences = Get-Content -LiteralPath $script:UiPreferencesPath -Raw -Encoding UTF8 | ConvertFrom-Json
         foreach ($propertyName in @('AutoRefresh', 'ShowExternalQuota', 'ShowInternalQuota')) {
             if ($null -ne $savedUiPreferences.PSObject.Properties[$propertyName]) {
                 $script:UiPreferences[$propertyName] = [bool]$savedUiPreferences.$propertyName
@@ -174,7 +228,11 @@ function Get-LanZSessionValue {
         $null,
         [System.Security.Cryptography.DataProtectionScope]::CurrentUser
     )
-    return [System.Text.Encoding]::UTF8.GetString($plainBytes).Trim()
+    $sessionValue = [System.Text.Encoding]::UTF8.GetString($plainBytes).Trim()
+    if ([string]::IsNullOrWhiteSpace($sessionValue) -or $sessionValue -eq '0') {
+        throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
+    }
+    return $sessionValue
 }
 
 function Save-LanZSessionValue {
@@ -217,30 +275,132 @@ function New-LanZRequestToken {
     }
 }
 
+function Add-LanZBrowserHeaders {
+    param(
+        [Parameter(Mandatory)][System.Net.Http.HttpRequestMessage]$Request,
+        [switch]$ForScript
+    )
+
+    # 仅供额度与计费规则的低频同步使用。模型负载只监听页面自身请求。
+    # 不手工设置 User-Agent，也不伪造 Sec-Fetch/Client-Hints。
+    $accept = if ($ForScript) { '*/*' } else { 'application/json, text/plain, */*' }
+    [void]$Request.Headers.TryAddWithoutValidation('Accept', $accept)
+    [void]$Request.Headers.TryAddWithoutValidation('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8')
+}
+
+function ConvertTo-LanZModels {
+    param(
+        [Parameter(Mandatory)][array]$Data,
+        [hashtable]$ActualModelMap
+    )
+
+    return @($Data | ForEach-Object {
+        $modelName = [string]$_.modelName
+        $actualModel = ''
+        if ($null -ne $ActualModelMap -and $ActualModelMap.ContainsKey($modelName)) {
+            $actualModel = [string]$ActualModelMap[$modelName]
+        }
+        $active = [int]$_.routeStatus.total_active
+        $capacity = [int]$_.routeStatus.effective_max_concurrent
+        $percent = if ($capacity -gt 0) {
+            [math]::Min(100, [math]::Floor($active * 100 / $capacity))
+        }
+        else {
+            0
+        }
+
+        $color = if ($percent -ge 85) {
+            '#F56C6C'
+        }
+        elseif ($percent -ge 60) {
+            '#E6A23C'
+        }
+        else {
+            '#45C391'
+        }
+
+        $cardBackground = if ($percent -ge 85) {
+            '#FFF0F0'
+        }
+        elseif ($percent -ge 60) {
+            '#FFF7E8'
+        }
+        else {
+            '#EDF9F4'
+        }
+
+        $cardBorder = if ($percent -ge 85) {
+            '#F5B8B8'
+        }
+        elseif ($percent -ge 60) {
+            '#EFD19B'
+        }
+        else {
+            '#A9DFC9'
+        }
+
+        [pscustomobject]@{
+            Name      = $modelName
+            ModelId   = [string]$_.apiInterface
+            ActualModel = $actualModel
+            Active    = $active
+            Capacity  = $capacity
+            Percent   = [int]$percent
+            Available = [bool]$_.routeStatus.available
+            Summary   = "$percent%   $active / $capacity"
+            Color     = $color
+            CardBackground = $cardBackground
+            CardBorder = $cardBorder
+        }
+    })
+}
+
 function Get-LanZModels {
-    param([string]$SessionValue)
+    param(
+        [string]$SessionValue,
+        [System.Net.Http.HttpClient]$HttpClient
+    )
 
     if ([string]::IsNullOrWhiteSpace($SessionValue)) {
         $SessionValue = Get-LanZSessionValue
     }
-    $handler = [System.Net.Http.HttpClientHandler]::new()
-    $handler.CheckCertificateRevocationList = $false
-    $handler.UseCookies = $false
-    $client = [System.Net.Http.HttpClient]::new($handler)
-    $client.Timeout = [TimeSpan]::FromSeconds(8)
+    $ownsClient = $null -eq $HttpClient
+    $handler = $null
+    if ($ownsClient) {
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        # 内网 TLS 代理的证书链在当前 Windows 环境无法查到 CRL，
+        # 强制启用会以 RevocationStatusUnknown 拒绝所有请求。这里仅关闭
+        # 吊销列表查询；.NET 仍会执行主机名、有效期和证书链校验。
+        $handler.CheckCertificateRevocationList = $false
+        $handler.UseCookies = $false
+        $HttpClient = [System.Net.Http.HttpClient]::new($handler)
+        $HttpClient.Timeout = [TimeSpan]::FromSeconds(8)
+    }
     $request = [System.Net.Http.HttpRequestMessage]::new(
         [System.Net.Http.HttpMethod]::Get,
         $script:Endpoint
     )
+    $response = $null
 
     try {
         [void]$request.Headers.TryAddWithoutValidation('Cookie', "$($script:SessionCookieName)=$SessionValue")
         [void]$request.Headers.TryAddWithoutValidation([string]$script:Configuration.RequestTokenHeader, (New-LanZRequestToken))
-        $response = $client.SendAsync($request).GetAwaiter().GetResult()
+        Add-LanZBrowserHeaders -Request $request
+        $response = $HttpClient.SendAsync($request).GetAwaiter().GetResult()
         $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
 
         if (-not $response.IsSuccessStatusCode) {
+            if ([int]$response.StatusCode -in @(401, 403)) {
+                throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
+            }
             throw "服务返回 HTTP $([int]$response.StatusCode)"
+        }
+
+        # 会话失效时服务端可能返回 200 + HTML 登录页而非 JSON。检测到 HTML
+        # 时视为未授权,抛 UnauthorizedAccessException 以触发登录窗口。
+        $trimmed = $content.TrimStart()
+        if ($trimmed.Length -gt 0 -and $trimmed[0] -eq '<') {
+            throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
         }
 
         $payload = $content | ConvertFrom-Json
@@ -251,90 +411,62 @@ function Get-LanZModels {
             throw "接口错误：$($payload.msg)"
         }
 
-        return @($payload.data | ForEach-Object {
-            $active = [int]$_.routeStatus.total_active
-            $capacity = [int]$_.routeStatus.effective_max_concurrent
-            $percent = if ($capacity -gt 0) {
-                [math]::Min(100, [math]::Floor($active * 100 / $capacity))
-            }
-            else {
-                0
-            }
-
-            $color = if ($percent -ge 85) {
-                '#F56C6C'
-            }
-            elseif ($percent -ge 60) {
-                '#E6A23C'
-            }
-            else {
-                '#45C391'
-            }
-
-            $cardBackground = if ($percent -ge 85) {
-                '#FFF0F0'
-            }
-            elseif ($percent -ge 60) {
-                '#FFF7E8'
-            }
-            else {
-                '#EDF9F4'
-            }
-
-            $cardBorder = if ($percent -ge 85) {
-                '#F5B8B8'
-            }
-            elseif ($percent -ge 60) {
-                '#EFD19B'
-            }
-            else {
-                '#A9DFC9'
-            }
-
-            [pscustomobject]@{
-                Name      = [string]$_.modelName
-                ModelId   = [string]$_.apiInterface
-                Active    = $active
-                Capacity  = $capacity
-                Percent   = [int]$percent
-                Available = [bool]$_.routeStatus.available
-                Summary   = "$percent%   $active / $capacity"
-                Color     = $color
-                CardBackground = $cardBackground
-                CardBorder = $cardBorder
-            }
-        })
+        return @(ConvertTo-LanZModels -Data @($payload.data))
     }
     finally {
+        if ($null -ne $response) {
+            $response.Dispose()
+        }
         $request.Dispose()
-        $client.Dispose()
-        $handler.Dispose()
+        if ($ownsClient) {
+            $HttpClient.Dispose()
+            $handler.Dispose()
+        }
     }
 }
 
 function Get-LanZUsageOverview {
-    param([string]$SessionValue)
+    param(
+        [string]$SessionValue,
+        [System.Net.Http.HttpClient]$HttpClient
+    )
 
     if ([string]::IsNullOrWhiteSpace($SessionValue)) {
         $SessionValue = Get-LanZSessionValue
     }
-    $handler = [System.Net.Http.HttpClientHandler]::new()
-    $handler.CheckCertificateRevocationList = $false
-    $handler.UseCookies = $false
-    $client = [System.Net.Http.HttpClient]::new($handler)
-    $client.Timeout = [TimeSpan]::FromSeconds(8)
+    $ownsClient = $null -eq $HttpClient
+    $handler = $null
+    if ($ownsClient) {
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        # 见 Get-LanZModels 中的 CRL 兼容说明；不改写服务器证书验证回调。
+        $handler.CheckCertificateRevocationList = $false
+        $handler.UseCookies = $false
+        $HttpClient = [System.Net.Http.HttpClient]::new($handler)
+        $HttpClient.Timeout = [TimeSpan]::FromSeconds(8)
+    }
     $request = [System.Net.Http.HttpRequestMessage]::new(
         [System.Net.Http.HttpMethod]::Get,
         $script:UsageEndpoint
     )
+    $response = $null
 
     try {
         [void]$request.Headers.TryAddWithoutValidation('Cookie', "$($script:SessionCookieName)=$SessionValue")
         [void]$request.Headers.TryAddWithoutValidation([string]$script:Configuration.RequestTokenHeader, (New-LanZRequestToken))
-        $response = $client.SendAsync($request).GetAwaiter().GetResult()
+        Add-LanZBrowserHeaders -Request $request
+        $response = $HttpClient.SendAsync($request).GetAwaiter().GetResult()
         $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         if (-not $response.IsSuccessStatusCode) {
+            if ([int]$response.StatusCode -in @(401, 403)) {
+                throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
+            }
             throw "用量服务返回 HTTP $([int]$response.StatusCode)"
+        }
+
+        # 会话失效时服务端可能返回 200 + HTML 登录页而非 JSON。
+        $trimmed = $content.TrimStart()
+        if ($trimmed.Length -gt 0 -and $trimmed[0] -eq '<') {
+            throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
         }
 
         $payload = $content | ConvertFrom-Json
@@ -347,27 +479,40 @@ function Get-LanZUsageOverview {
         return $payload.data.overview
     }
     finally {
+        if ($null -ne $response) {
+            $response.Dispose()
+        }
         $request.Dispose()
-        $client.Dispose()
-        $handler.Dispose()
+        if ($ownsClient) {
+            $HttpClient.Dispose()
+            $handler.Dispose()
+        }
     }
 }
 
 function Get-LanZAuthenticatedText {
     param(
         [Parameter(Mandatory)][Uri]$Uri,
-        [Parameter(Mandatory)][string]$SessionValue
+        [Parameter(Mandatory)][string]$SessionValue,
+        [System.Net.Http.HttpClient]$HttpClient
     )
 
-    $handler = [System.Net.Http.HttpClientHandler]::new()
-    $handler.CheckCertificateRevocationList = $false
-    $handler.UseCookies = $false
-    $client = [System.Net.Http.HttpClient]::new($handler)
-    $client.Timeout = [TimeSpan]::FromSeconds(8)
+    $ownsClient = $null -eq $HttpClient
+    $handler = $null
+    if ($ownsClient) {
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        # 见 Get-LanZModels 中的 CRL 兼容说明；不改写服务器证书验证回调。
+        $handler.CheckCertificateRevocationList = $false
+        $handler.UseCookies = $false
+        $HttpClient = [System.Net.Http.HttpClient]::new($handler)
+        $HttpClient.Timeout = [TimeSpan]::FromSeconds(8)
+    }
     $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Uri)
+    $response = $null
     try {
         [void]$request.Headers.TryAddWithoutValidation('Cookie', "$($script:SessionCookieName)=$SessionValue")
-        $response = $client.SendAsync($request).GetAwaiter().GetResult()
+        Add-LanZBrowserHeaders -Request $request -ForScript
+        $response = $HttpClient.SendAsync($request).GetAwaiter().GetResult()
         $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         if ([int]$response.StatusCode -in @(401, 403)) {
             throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
@@ -378,9 +523,65 @@ function Get-LanZAuthenticatedText {
         return $content
     }
     finally {
+        if ($null -ne $response) {
+            $response.Dispose()
+        }
         $request.Dispose()
-        $client.Dispose()
-        $handler.Dispose()
+        if ($ownsClient) {
+            $HttpClient.Dispose()
+            $handler.Dispose()
+        }
+    }
+}
+
+function Import-LanZRefreshCadence {
+    # 读取上次用量/规则刷新时间,用于在 worker 内决定是否低频调用。
+    # 文件缺失或损坏时回退到 MinValue,触发首次调用。
+    try {
+        if (Test-Path -LiteralPath $script:CadencePath) {
+            $cached = Get-Content -LiteralPath $script:CadencePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $cached.LastUsageFetch) {
+                $script:LastUsageFetchUtc = [DateTime]::Parse(
+                    [string]$cached.LastUsageFetch,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind
+                ).ToUniversalTime()
+            }
+            if ($null -ne $cached.LastBillingFetch) {
+                $script:LastBillingFetchUtc = [DateTime]::Parse(
+                    [string]$cached.LastBillingFetch,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind
+                ).ToUniversalTime()
+            }
+        }
+    }
+    catch {
+        $script:LastUsageFetchUtc = [DateTime]::MinValue
+        $script:LastBillingFetchUtc = [DateTime]::MinValue
+    }
+}
+
+function Save-LanZRefreshCadence {
+    param(
+        [switch]$UsageUpdated,
+        [switch]$BillingUpdated
+    )
+    try {
+        if ($UsageUpdated) {
+            $script:LastUsageFetchUtc = [DateTime]::UtcNow
+        }
+        if ($BillingUpdated) {
+            $script:LastBillingFetchUtc = [DateTime]::UtcNow
+        }
+        $cadence = [ordered]@{
+            LastUsageFetch = if ($script:LastUsageFetchUtc -ne [DateTime]::MinValue) { $script:LastUsageFetchUtc.ToString('o') } else { $null }
+            LastBillingFetch = if ($script:LastBillingFetchUtc -ne [DateTime]::MinValue) { $script:LastBillingFetchUtc.ToString('o') } else { $null }
+        }
+        [IO.File]::WriteAllText($script:CadencePath, ($cadence | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        # 节奏持久化失败不影响实时刷新,下次按内存时间继续。
     }
 }
 
@@ -390,7 +591,7 @@ function Import-LanZBillingRulesCache {
     }
     try {
         if (Test-Path -LiteralPath $script:BillingRulesPath) {
-            $cached = Get-Content -LiteralPath $script:BillingRulesPath -Raw | ConvertFrom-Json
+            $cached = Get-Content -LiteralPath $script:BillingRulesPath -Raw -Encoding UTF8 | ConvertFrom-Json
             if (@($cached.Intervals).Count -gt 0) {
                 $script:BillingRules = $cached
             }
@@ -403,7 +604,26 @@ function Import-LanZBillingRulesCache {
 }
 
 function Get-LanZBillingRules {
-    param([Parameter(Mandatory)][string]$SessionValue)
+    param(
+        [Parameter(Mandatory)][string]$SessionValue,
+        [System.Net.Http.HttpClient]$HttpClient
+    )
+
+    # 手动覆盖文件优先级最高:用户可手写规则,在前端改版导致自动抓取失效时兜底。
+    # 文件格式与 billing-rules.json 相同(FetchedAt/ScheduleText/WeekendFree/Intervals)。
+    # 覆盖文件存在且有效时,直接返回,不再抓取网页。
+    try {
+        if (Test-Path -LiteralPath $script:BillingOverridesPath) {
+            $override = Get-Content -LiteralPath $script:BillingOverridesPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if (@($override.Intervals).Count -gt 0) {
+                $script:BillingRules = $override
+                return $override
+            }
+        }
+    }
+    catch {
+        # 覆盖文件损坏则忽略,回退到自动抓取。
+    }
 
     $cached = Import-LanZBillingRulesCache
     if ($null -ne $cached) {
@@ -413,7 +633,8 @@ function Get-LanZBillingRules {
                 [Globalization.CultureInfo]::InvariantCulture,
                 [Globalization.DateTimeStyles]::RoundtripKind
             ).ToUniversalTime()
-            if (([DateTime]::UtcNow - $fetchedAt).TotalMinutes -lt 30) {
+            $billingWindow = if ($null -ne $script:BillingRefreshSeconds) { [int]$script:BillingRefreshSeconds } else { 14400 }
+            if (([DateTime]::UtcNow - $fetchedAt).TotalSeconds -lt $billingWindow) {
                 return $cached
             }
         }
@@ -424,7 +645,7 @@ function Get-LanZBillingRules {
 
     try {
         $dashboardUri = [Uri]$script:UsageDashboardUrl
-        $dashboardHtml = Get-LanZAuthenticatedText -Uri $dashboardUri -SessionValue $SessionValue
+        $dashboardHtml = Get-LanZAuthenticatedText -Uri $dashboardUri -SessionValue $SessionValue -HttpClient $HttpClient
         $scriptMatches = [regex]::Matches(
             $dashboardHtml,
             '<script\b[^>]*\bsrc\s*=\s*(?:"(?<src>[^"]+)"|''(?<src>[^'']+)''|(?<src>[^\s>]+))',
@@ -439,8 +660,8 @@ function Get-LanZBillingRules {
             throw '资源看板的前端入口未找到。'
         }
 
-        $runtimeText = Get-LanZAuthenticatedText -Uri $runtimeUri -SessionValue $SessionValue
-        $appText = Get-LanZAuthenticatedText -Uri $appUri -SessionValue $SessionValue
+        $runtimeText = Get-LanZAuthenticatedText -Uri $runtimeUri -SessionValue $SessionValue -HttpClient $HttpClient
+        $appText = Get-LanZAuthenticatedText -Uri $appUri -SessionValue $SessionValue -HttpClient $HttpClient
         $routePath = $dashboardUri.AbsolutePath
         $chunkIds = [System.Collections.Generic.HashSet[string]]::new()
         $preferredChunkIds = [System.Collections.Generic.List[string]]::new()
@@ -482,7 +703,7 @@ function Get-LanZBillingRules {
                 continue
             }
             $chunkUri = [Uri]::new($runtimeUri, "$chunkId.$($hashMatch.Groups['hash'].Value).js")
-            $chunkText = Get-LanZAuthenticatedText -Uri $chunkUri -SessionValue $SessionValue
+            $chunkText = Get-LanZAuthenticatedText -Uri $chunkUri -SessionValue $SessionValue -HttpClient $HttpClient
             $descriptionMatch = [regex]::Match(
                 $chunkText,
                 'billingFreeDesc\s*:\s*function\(\)\s*\{\s*return\s*"(?<text>(?:\\.|[^"\\])*)"'
@@ -672,10 +893,34 @@ function New-LanZQuotaViewModel {
     }
 }
 
+function Update-LanZLocalQuotaStatus {
+    # 规则同步和时段判断是两件事：规则可以低频抓取，但当前免费/计费
+    # 状态必须使用本地时间高频重算。此函数只更新绑定，不产生网络流量。
+    $overview = $script:BrowserUsage
+    if ($null -eq $overview -and $null -ne $script:CachedStatusSnapshot) {
+        $overview = $script:CachedStatusSnapshot.Usage
+    }
+    if ($null -eq $overview) {
+        return
+    }
+    if ($null -eq $script:BillingRules) {
+        $script:BillingRules = Import-LanZBillingRulesCache
+    }
+    $usageCard.DataContext = New-LanZQuotaViewModel -Overview $overview -BillingRules $script:BillingRules
+}
+
 if ($Once) {
     Get-LanZModels | Select-Object Name, ModelId, Active, Capacity, Percent, Available | ConvertTo-Json -Depth 3
     exit 0
 }
+
+# HttpClient 仅用于额度与计费规则的低频同步，模型负载不使用它。
+# 复用连接池和 TLS 会话，避免每次低频同步都新建 handler/连接。
+$script:SharedHttpHandler = [System.Net.Http.HttpClientHandler]::new()
+$script:SharedHttpHandler.CheckCertificateRevocationList = $false
+$script:SharedHttpHandler.UseCookies = $false
+$script:SharedHttpClient = [System.Net.Http.HttpClient]::new($script:SharedHttpHandler)
+$script:SharedHttpClient.Timeout = [TimeSpan]::FromSeconds(8)
 
 $createdNew = $false
 $singleInstanceMutex = [System.Threading.Mutex]::new(
@@ -684,7 +929,21 @@ $singleInstanceMutex = [System.Threading.Mutex]::new(
     [ref]$createdNew
 )
 if (-not $createdNew) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [void][Windows.Forms.MessageBox]::Show(
+            'LanZ Monitor 已在系统托盘运行，请勿重复启动。可双击托盘图标显示窗口。',
+            'LanZ Monitor',
+            [Windows.Forms.MessageBoxButtons]::OK,
+            [Windows.Forms.MessageBoxIcon]::Information
+        )
+    }
+    catch {
+        # 即使提示框不可用，第二个实例也必须安静退出。
+    }
     $singleInstanceMutex.Dispose()
+    $script:SharedHttpClient.Dispose()
+    $script:SharedHttpHandler.Dispose()
     exit 0
 }
 
@@ -692,6 +951,8 @@ try {
     Add-Type -AssemblyName PresentationFramework
     Add-Type -AssemblyName PresentationCore
     Add-Type -AssemblyName WindowsBase
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
 
 function Initialize-LanZHistory {
     if (-not (Test-Path -LiteralPath $script:HistoryPath)) {
@@ -699,7 +960,7 @@ function Initialize-LanZHistory {
     }
 
     try {
-        $payload = Get-Content -LiteralPath $script:HistoryPath -Raw | ConvertFrom-Json
+        $payload = Get-Content -LiteralPath $script:HistoryPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $cutoff = [DateTime]::UtcNow.AddHours(-5)
         foreach ($property in $payload.PSObject.Properties) {
             $history = [System.Collections.Generic.List[object]]::new()
@@ -751,7 +1012,7 @@ function Initialize-LanZHistory {
 function Initialize-LanZStatusSnapshot {
     try {
         if (Test-Path -LiteralPath $script:LatestStatusPath) {
-            $script:CachedStatusSnapshot = Get-Content -LiteralPath $script:LatestStatusPath -Raw | ConvertFrom-Json
+            $script:CachedStatusSnapshot = Get-Content -LiteralPath $script:LatestStatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
         }
         $lastLine = if (Test-Path -LiteralPath $script:StatusLogPath) {
             [IO.File]::ReadLines($script:StatusLogPath) |
@@ -790,6 +1051,7 @@ function Save-LanZStatusSnapshot {
             [ordered]@{
                 Name = [string]$_.Name
                 ModelId = [string]$_.ModelId
+                ActualModel = if ($null -ne $_.PSObject.Properties['ActualModel']) { [string]$_.ActualModel } else { '' }
                 Active = [int]$_.Active
                 Capacity = [int]$_.Capacity
                 Percent = [int]$_.Percent
@@ -1202,34 +1464,83 @@ function Add-LanZChartHistory {
 
 Initialize-LanZHistory
 Initialize-LanZStatusSnapshot
+Import-LanZRefreshCadence
+[void](Import-LanZBillingRulesCache)
 
 function Save-LanZModelOrder {
-    $json = ConvertTo-Json -InputObject @($script:ModelOrder) -Compress
+    $payload = [ordered]@{
+        Version = $script:ModelOrderSchemaVersion
+        UserDefined = [bool]$script:ModelOrderUserDefined
+        Order = @($script:ModelOrder)
+    }
+    $json = ConvertTo-Json -InputObject $payload -Depth 3 -Compress
     [System.IO.File]::WriteAllText($script:ModelOrderPath, $json, [System.Text.UTF8Encoding]::new($false))
+    $script:ModelOrderNeedsSave = $false
 }
 
 function Sort-LanZModels {
     param([Parameter(Mandatory)][array]$Models)
 
-    $orderIndex = @{}
-    for ($index = 0; $index -lt $script:ModelOrder.Count; $index++) {
-        $orderIndex[$script:ModelOrder[$index]] = $index
+    $orderChanged = $false
+    # A saved v2 order is authoritative. On first run/migration, seed it with the
+    # current preferred IDs and then append every unknown model in server order.
+    # Missing preferred IDs are simply ignored; future models never need code changes.
+    if (-not $script:ModelOrderUserDefined) {
+        $availableIds = @{}
+        foreach ($model in $Models) {
+            $modelId = [string]$model.ModelId
+            if (-not [string]::IsNullOrWhiteSpace($modelId)) {
+                $availableIds[$modelId] = $true
+            }
+        }
+        $defaultOrder = [System.Collections.Generic.List[string]]::new()
+        $defaultSeen = @{}
+        foreach ($hint in $script:DefaultModelOrderHints) {
+            if ($availableIds.ContainsKey($hint)) {
+                $defaultOrder.Add($hint)
+                $defaultSeen[$hint] = $true
+            }
+        }
+        foreach ($model in $Models) {
+            $modelId = [string]$model.ModelId
+            if (-not [string]::IsNullOrWhiteSpace($modelId) -and -not $defaultSeen.ContainsKey($modelId)) {
+                $defaultOrder.Add($modelId)
+                $defaultSeen[$modelId] = $true
+            }
+        }
+        if (($script:ModelOrder -join "`n") -ne ($defaultOrder -join "`n")) {
+            $script:ModelOrder.Clear()
+            foreach ($modelId in $defaultOrder) {
+                $script:ModelOrder.Add($modelId)
+            }
+            $orderChanged = $true
+        }
     }
 
-    $orderChanged = $false
+    $orderIndex = @{}
+    for ($index = 0; $index -lt $script:ModelOrder.Count; $index++) {
+        $modelId = [string]$script:ModelOrder[$index]
+        if (-not [string]::IsNullOrWhiteSpace($modelId) -and -not $orderIndex.ContainsKey($modelId)) {
+            $orderIndex[$modelId] = $index
+        }
+    }
+
     foreach ($model in $Models) {
         $modelId = [string]$model.ModelId
-        if (-not $orderIndex.ContainsKey($modelId)) {
+        if (-not [string]::IsNullOrWhiteSpace($modelId) -and -not $orderIndex.ContainsKey($modelId)) {
             $orderIndex[$modelId] = $script:ModelOrder.Count
             $script:ModelOrder.Add($modelId)
             $orderChanged = $true
         }
     }
-    if ($orderChanged) {
+    if ($orderChanged -or $script:ModelOrderNeedsSave -or -not (Test-Path -LiteralPath $script:ModelOrderPath)) {
         Save-LanZModelOrder
     }
 
-    return @($Models | Sort-Object @{ Expression = { $orderIndex[[string]$_.ModelId] } })
+    return @($Models | Sort-Object @{ Expression = {
+        $modelId = [string]$_.ModelId
+        if ($orderIndex.ContainsKey($modelId)) { $orderIndex[$modelId] } else { [int]::MaxValue }
+    } })
 }
 
 function Get-LanZModelFromVisual {
@@ -1293,7 +1604,7 @@ function Export-LanZWindowScreenshot {
         Width="430" Height="560"
         WindowStyle="None" ResizeMode="NoResize"
         AllowsTransparency="True" Background="Transparent"
-        Topmost="True" ShowInTaskbar="True"
+        Topmost="True" ShowInTaskbar="False"
         WindowStartupLocation="CenterScreen">
     <Window.Resources>
         <Style x:Key="AutoToggleStyle" TargetType="{x:Type ToggleButton}">
@@ -1348,8 +1659,8 @@ function Export-LanZWindowScreenshot {
                 </StackPanel>
                 <ToggleButton x:Name="PinToggle" Grid.Column="1" Content="📌" IsChecked="True" Width="30" Height="25" FontSize="13" Style="{StaticResource AutoToggleStyle}" ToolTip="已置顶，点击取消"/>
                 <Button x:Name="RefreshButton" Grid.Column="2" Content="↻" FontSize="18" Foreground="#536675" Background="Transparent" BorderThickness="0" Cursor="Hand" ToolTip="立即刷新"/>
-                <ToggleButton x:Name="SettingsButton" Grid.Column="3" Content="⚙" Width="30" Height="25" FontSize="15" Style="{StaticResource AutoToggleStyle}" ToolTip="设置"/>
-                <Button x:Name="CloseButton" Grid.Column="4" Content="×" FontSize="20" Foreground="#536675" Background="Transparent" BorderThickness="0" Cursor="Hand" ToolTip="关闭"/>
+                <ToggleButton x:Name="SettingsButton" Grid.Column="3" Content="&#xE713;" FontFamily="Segoe Fluent Icons" Width="30" Height="25" FontSize="15" Style="{StaticResource AutoToggleStyle}" ToolTip="设置"/>
+                <Button x:Name="CloseButton" Grid.Column="4" Content="×" FontSize="20" Foreground="#536675" Background="Transparent" BorderThickness="0" Cursor="Hand" ToolTip="隐藏到托盘"/>
             </Grid>
 
             <Border x:Name="UsageCard" Grid.Row="1" Background="#FFFFFF" BorderBrush="#E2E8ED" BorderThickness="1" CornerRadius="11" Padding="12,8" Margin="0,0,0,8">
@@ -1427,7 +1738,7 @@ function Export-LanZWindowScreenshot {
                                     <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="SemiBold" Foreground="#314452"/>
                                 </StackPanel>
                                 <TextBlock Grid.Column="1" Text="{Binding Summary}" FontSize="12" Foreground="#61727E"/>
-                                <TextBlock Grid.Row="1" Grid.ColumnSpan="2" Text="{Binding ModelId}" FontSize="11" FontWeight="Normal" Foreground="#87949E" TextTrimming="CharacterEllipsis"/>
+                                <TextBlock Grid.Row="1" Grid.ColumnSpan="2" Text="{Binding ActualModel}" FontSize="11" FontWeight="Normal" Foreground="#87949E" TextTrimming="CharacterEllipsis" ToolTip="{Binding ActualModel}"/>
                                 <Grid Grid.Row="2" Grid.ColumnSpan="2" Height="44" ClipToBounds="True">
                                     <Border Background="#F4F7F9" CornerRadius="5"/>
                                     <Canvas Width="330" Height="42" HorizontalAlignment="Left" VerticalAlignment="Center" ClipToBounds="True">
@@ -1495,7 +1806,7 @@ function Export-LanZWindowScreenshot {
                     <Border.Effect><DropShadowEffect BlurRadius="14" ShadowDepth="3" Opacity="0.22" Color="#203040"/></Border.Effect>
                     <StackPanel>
                         <TextBlock Text="显示与刷新" FontSize="11" FontWeight="SemiBold" Foreground="#314452" Margin="2,0,0,7"/>
-                        <CheckBox x:Name="AutoRefreshToggle" Content="自动刷新（10 秒）" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
+                        <CheckBox x:Name="AutoRefreshToggle" Content="自动刷新（跟随网页，约 3 秒）" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
                         <CheckBox x:Name="ShowExternalQuotaToggle" Content="显示外网模型额度" IsChecked="False" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
                         <CheckBox x:Name="ShowInternalQuotaToggle" Content="显示内网模型额度" IsChecked="True" FontSize="11" Foreground="#536675" Margin="2,4" Cursor="Hand"/>
                         <StackPanel Orientation="Horizontal" Margin="2,5,0,0">
@@ -1542,6 +1853,655 @@ $showInternalQuotaToggle.IsChecked = [bool]$script:UiPreferences.ShowInternalQuo
 $barChartToggle.IsChecked = $script:UiPreferences.ChartMode -eq 'bar'
 $lineChartToggle.IsChecked = $script:UiPreferences.ChartMode -eq 'line'
 
+function Import-LanZWebView2Runtime {
+    $requiredFiles = @(
+        'Microsoft.Web.WebView2.Core.dll',
+        'Microsoft.Web.WebView2.Wpf.dll',
+        'WebView2Loader.dll'
+    )
+
+    # 源码运行时直接使用仓库依赖。单文件 EXE 则把 ps2exe 的固定释放目录
+    # 仅当作未加载的 payload，再复制到按内容哈希区分的实际加载目录。
+    # 因此重复双击时，第二个进程可以安全覆盖 payload，并在互斥锁检查后
+    # 退出，不会尝试覆盖第一个实例已经加载并锁定的 WebView2Loader.dll。
+    $sourceDirectory = Join-Path $script:AppDirectory 'lib\WebView2'
+    $sourceReady = @($requiredFiles | ForEach-Object { Test-Path -LiteralPath (Join-Path $sourceDirectory $_) }) -notcontains $false
+    if ($sourceReady) {
+        $webViewDirectory = $sourceDirectory
+    }
+    else {
+        $payloadDirectory = Join-Path $script:RuntimeDirectory 'WebView2Payload'
+        $payloadReady = @($requiredFiles | ForEach-Object { Test-Path -LiteralPath (Join-Path $payloadDirectory $_) }) -notcontains $false
+        if (-not $payloadReady) {
+            throw '缺少 WebView2 组件，请重新获取完整程序。'
+        }
+
+        $componentHashes = foreach ($fileName in $requiredFiles) {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+                $bytes = [IO.File]::ReadAllBytes((Join-Path $payloadDirectory $fileName))
+                ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '')
+            }
+            finally {
+                $sha.Dispose()
+            }
+        }
+        $manifestSha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $manifestBytes = [Text.Encoding]::UTF8.GetBytes(($componentHashes -join ':'))
+            $fingerprint = ([BitConverter]::ToString($manifestSha.ComputeHash($manifestBytes))).Replace('-', '').Substring(0, 16)
+        }
+        finally {
+            $manifestSha.Dispose()
+        }
+
+        $webViewDirectory = Join-Path (Join-Path $script:RuntimeDirectory 'WebView2') $fingerprint
+        [void][IO.Directory]::CreateDirectory($webViewDirectory)
+        foreach ($fileName in $requiredFiles) {
+            $payloadPath = Join-Path $payloadDirectory $fileName
+            $runtimePath = Join-Path $webViewDirectory $fileName
+            $copyRequired = -not (Test-Path -LiteralPath $runtimePath)
+            if (-not $copyRequired) {
+                $copyRequired = (Get-Item -LiteralPath $payloadPath).Length -ne (Get-Item -LiteralPath $runtimePath).Length
+            }
+            if ($copyRequired) {
+                Copy-Item -LiteralPath $payloadPath -Destination $runtimePath -Force
+            }
+        }
+    }
+
+    $coreAssembly = Join-Path $webViewDirectory 'Microsoft.Web.WebView2.Core.dll'
+    $wpfAssembly = Join-Path $webViewDirectory 'Microsoft.Web.WebView2.Wpf.dll'
+    $loaderAssembly = Join-Path $webViewDirectory 'WebView2Loader.dll'
+    if (-not (Test-Path -LiteralPath $coreAssembly) -or -not (Test-Path -LiteralPath $wpfAssembly) -or -not (Test-Path -LiteralPath $loaderAssembly)) {
+        throw 'WebView2 组件准备失败，请重新获取完整程序。'
+    }
+
+    $env:PATH = "$webViewDirectory;$env:PATH"
+    if ($null -eq ('Microsoft.Web.WebView2.Core.CoreWebView2Environment' -as [type])) {
+        Add-Type -Path $coreAssembly
+    }
+    if ($null -eq ('Microsoft.Web.WebView2.Wpf.WebView2' -as [type])) {
+        Add-Type -Path $wpfAssembly
+    }
+    return $webViewDirectory
+}
+
+function Update-LanZFromBrowserCapture {
+    if ($null -eq $script:BrowserModels) {
+        return
+    }
+
+    $overview = $script:BrowserUsage
+    if ($null -eq $overview -and $null -ne $script:CachedStatusSnapshot) {
+        $overview = $script:CachedStatusSnapshot.Usage
+    }
+    if ($null -eq $overview) {
+        return
+    }
+
+    $models = @($script:BrowserModels)
+    $modelsWithHistory = @(Add-LanZChartHistory -Models $models)
+    $script:DisplayedModels = @(Sort-LanZModels -Models $modelsWithHistory)
+    $modelsList.ItemsSource = $script:DisplayedModels
+    Update-LanZLocalQuotaStatus
+    try {
+        Save-LanZStatusSnapshot -Models $models -Overview $overview
+    }
+    catch {
+        # 浏览器数据仍可实时显示；本地快照失败不阻断同步。
+    }
+    $script:LastSuccessfulModelRefreshUtc = [DateTime]::UtcNow
+    $updatedText.Text = '浏览器同步 ' + (Get-Date).ToString('HH:mm:ss')
+    $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
+}
+
+function Set-LanZActualModelMappings {
+    param([Parameter(Mandatory)][array]$Mappings)
+
+    $validRows = @($Mappings | Where-Object {
+        $null -ne $_ -and
+        $null -ne $_.PSObject.Properties['ProductName'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$_.ProductName)
+    })
+    if ($validRows.Count -eq 0) {
+        return $false
+    }
+
+    $newMap = @{}
+    foreach ($mapping in $validRows) {
+        $productName = ([string]$mapping.ProductName).Trim()
+        $actualModel = if ($null -ne $mapping.PSObject.Properties['ActualModel']) {
+            ([string]$mapping.ActualModel).Trim()
+        }
+        else {
+            ''
+        }
+        # UI text only: discard unexpectedly large/multiline values instead of allowing
+        # a page change to disturb the card layout. An empty value is intentionally valid.
+        if ($productName.Length -le 128 -and $actualModel.Length -le 160 -and $actualModel -notmatch '[\r\n]') {
+            $newMap[$productName] = $actualModel
+        }
+    }
+    if ($newMap.Count -eq 0) {
+        return $false
+    }
+
+    $script:BrowserActualModelMap = $newMap
+    foreach ($model in @($script:BrowserModels) + @($script:DisplayedModels)) {
+        if ($null -eq $model -or $null -eq $model.PSObject.Properties['Name']) {
+            continue
+        }
+        $actualModel = ''
+        $productName = [string]$model.Name
+        if ($newMap.ContainsKey($productName)) {
+            $actualModel = [string]$newMap[$productName]
+        }
+        $model | Add-Member -NotePropertyName ActualModel -NotePropertyValue $actualModel -Force
+    }
+    if ($null -ne $modelsList -and $script:DisplayedModels.Count -gt 0) {
+        $modelsList.Items.Refresh()
+    }
+    return $true
+}
+
+function Complete-LanZBrowserResponses {
+    for ($index = $script:BrowserResponseQueue.Count - 1; $index -ge 0; $index--) {
+        $entry = $script:BrowserResponseQueue[$index]
+        if (-not $entry.Task.IsCompleted) {
+            continue
+        }
+        $script:BrowserResponseQueue.RemoveAt($index)
+        if ($entry.Task.IsFaulted -or $entry.Task.IsCanceled) {
+            Write-LanZBrowserDiag ('response task failed kind={0}' -f $entry.Kind)
+            continue
+        }
+
+        $stream = $null
+        $reader = $null
+        try {
+            $stream = $entry.Task.GetAwaiter().GetResult()
+            if ($null -eq $stream) {
+                continue
+            }
+            $reader = [IO.StreamReader]::new($stream)
+            $content = $reader.ReadToEnd()
+            $trimmed = $content.TrimStart()
+            if ($trimmed.Length -eq 0 -or $trimmed[0] -ne '{') {
+                continue
+            }
+            $payload = $content | ConvertFrom-Json
+            if ([int]$payload.code -ne [int]$script:Configuration.SuccessCode) {
+                continue
+            }
+
+            if ($entry.Kind -eq 'models') {
+                $script:BrowserModels = @(ConvertTo-LanZModels -Data @($payload.data) -ActualModelMap $script:BrowserActualModelMap)
+                $script:BrowserLastModelsUtc = [DateTime]::UtcNow
+                if ($null -ne $script:BrowserCaptureState -and $script:BrowserCaptureState.AtMonitorPage) {
+                    $script:BrowserCaptureState.MonitorPanelReady = $true
+                }
+                Update-LanZFromBrowserCapture
+                if ($null -ne $script:BrowserCaptureState -and -not $script:BrowserCaptureState.FirstCaptureLogged) {
+                    $script:BrowserCaptureState.FirstCaptureLogged = $true
+                    Write-LanZBrowserDiag ('initial capture ready models={0}' -f @($script:BrowserModels).Count)
+                }
+            }
+            elseif ($entry.Kind -eq 'usage' -and $null -ne $payload.data.overview) {
+                $script:BrowserUsage = $payload.data.overview
+                $script:BrowserLastUsageUtc = [DateTime]::UtcNow
+                Save-LanZRefreshCadence -UsageUpdated
+                Update-LanZFromBrowserCapture
+            }
+        }
+        catch {
+            # 某个响应读取失败时保留缓存，等待页面下一次正常响应或低频回退。
+            Write-LanZBrowserDiag ('response parse failed kind={0} error={1}' -f $entry.Kind, $_.Exception.GetBaseException().Message)
+        }
+        finally {
+            if ($null -ne $reader) {
+                $reader.Dispose()
+            }
+            elseif ($null -ne $stream) {
+                $stream.Dispose()
+            }
+        }
+    }
+}
+
+function Step-LanZBrowserCapture {
+    $state = $script:BrowserCaptureState
+    if ($null -eq $state -or $null -eq $script:BrowserView) {
+        return
+    }
+
+    try {
+        if ($state.Stage -eq 'ensure') {
+            if (-not $state.EnsureTask.IsCompleted) {
+                return
+            }
+            if ($state.EnsureTask.IsFaulted) {
+                throw $state.EnsureTask.Exception.GetBaseException()
+            }
+
+            $core = $script:BrowserView.CoreWebView2
+            Write-LanZBrowserDiag 'webview ensure completed'
+            $core.Settings.AreDevToolsEnabled = $false
+            $core.Settings.AreDefaultContextMenusEnabled = $false
+            $core.Settings.IsPasswordAutosaveEnabled = $false
+            $core.Settings.IsGeneralAutofillEnabled = $false
+
+            # GetNewClosure() 会创建动态模块，其中的 $script: 不再指向主脚本。
+            # 显式捕获队列引用，避免响应任务在事件闭包中静默丢失。
+            $browserResponseQueue = $script:BrowserResponseQueue
+            $responseHandler = ({
+                param($sender, $eventArgs)
+                try {
+                    $requestUri = [Uri][string]$eventArgs.Request.Uri
+                    $kind = $null
+                    if ($requestUri.Host -eq $state.EndpointHost -and $requestUri.AbsolutePath -eq $state.ModelPath) {
+                        $kind = 'models'
+                    }
+                    elseif ($requestUri.Host -eq $state.EndpointHost -and $requestUri.AbsolutePath -eq $state.UsagePath) {
+                        $kind = 'usage'
+                    }
+                    if ($null -ne $kind -and [int]$eventArgs.Response.StatusCode -eq 200) {
+                        $contentTask = $eventArgs.Response.GetContentAsync()
+                        $browserResponseQueue.Add([pscustomobject]@{
+                            Kind = $kind
+                            Task = $contentTask
+                        })
+                    }
+                }
+                catch {
+                    # 仅监听目标 JSON 响应，其他页面资源一律忽略。
+                }
+            }).GetNewClosure()
+            $state.ResponseHandler = $responseHandler
+            $core.add_WebResourceResponseReceived($responseHandler)
+            $core.AddWebResourceRequestedFilter('*', [Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext]::All)
+
+            $navigationHandler = ({
+                param($sender, $eventArgs)
+                try {
+                    if ($eventArgs.IsSuccess) {
+                        $sourceUri = [Uri][string]$sender.CoreWebView2.Source
+                        if ($sourceUri.Scheme -in @('http', 'https')) {
+                            $state.SignedOut = $sourceUri.Host -ne $state.EndpointHost
+                            if ($state.SignedOut) {
+                                Write-LanZBrowserDiag ('navigation left service path={0}' -f $sourceUri.AbsolutePath)
+                            }
+                            else {
+                                $state.AtMonitorPage = $sourceUri.AbsolutePath -eq ([Uri]$state.MonitorUri).AbsolutePath
+                                if ($state.AtMonitorPage) {
+                                    $state.MonitorPanelReady = $false
+                                    $state.PanelScriptTask = $null
+                                    $state.PanelNextAttemptUtc = [DateTime]::UtcNow
+                                    $state.ModelMetadataTask = $null
+                                    $state.ModelMetadataNextAttemptUtc = [DateTime]::UtcNow
+                                }
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }).GetNewClosure()
+            $state.NavigationHandler = $navigationHandler
+            $script:BrowserView.add_NavigationCompleted($navigationHandler)
+
+            $sessionValue = Get-LanZSessionValue
+            try {
+                $cookie = $core.CookieManager.CreateCookie($state.CookieName, $sessionValue, $state.EndpointHost, '/')
+                $cookie.IsHttpOnly = $true
+                $cookie.IsSecure = $true
+                $core.CookieManager.AddOrUpdateCookie($cookie)
+            }
+            finally {
+                $sessionValue = $null
+            }
+
+            $core.Navigate($state.NavigationUri)
+            Write-LanZBrowserDiag ('navigate dashboard path={0}' -f ([Uri]$state.NavigationUri).AbsolutePath)
+            $state.Stage = 'bootstrap'
+            return
+        }
+
+        if ($state.Stage -eq 'bootstrap') {
+            Complete-LanZBrowserResponses
+            $bootstrapReady = $null -ne $script:BrowserModels -and $null -ne $script:BrowserUsage
+            if ($bootstrapReady -or [DateTime]::UtcNow -ge $state.BootstrapDeadlineUtc) {
+                $script:BrowserView.CoreWebView2.Navigate($state.MonitorUri)
+                $state.LastNavigationUtc = [DateTime]::UtcNow
+                $state.Stage = 'monitor'
+                Write-LanZBrowserDiag ('navigate model monitor path={0}' -f ([Uri]$state.MonitorUri).AbsolutePath)
+            }
+            return
+        }
+
+        if ($state.Stage -eq 'monitor') {
+            Complete-LanZBrowserResponses
+            if ($state.SignedOut -or -not $state.AtMonitorPage) {
+                return
+            }
+
+            if ($null -ne $state.PanelScriptTask -and $state.PanelScriptTask.IsCompleted) {
+                $state.PanelScriptTask = $null
+            }
+            if ($null -ne $state.ModelMetadataTask -and $state.ModelMetadataTask.IsCompleted) {
+                $metadataReadSucceeded = $false
+                try {
+                    if (-not $state.ModelMetadataTask.IsFaulted -and -not $state.ModelMetadataTask.IsCanceled) {
+                        $metadataJson = [string]$state.ModelMetadataTask.GetAwaiter().GetResult()
+                        if (-not [string]::IsNullOrWhiteSpace($metadataJson) -and $metadataJson -ne 'null') {
+                            $metadataValue = $metadataJson | ConvertFrom-Json
+                            # Some WebView2 runtime builds return an already-serialized JSON
+                            # string. Accept either representation without assuming a version.
+                            if ($metadataValue -is [string] -and $metadataValue.TrimStart() -match '^[\[{]') {
+                                $metadataValue = $metadataValue | ConvertFrom-Json
+                            }
+                            $metadataRows = @($metadataValue)
+                            if (Set-LanZActualModelMappings -Mappings $metadataRows) {
+                                $metadataReadSucceeded = $true
+                                Write-LanZBrowserDiag ('model metadata parsed rows={0}' -f $metadataRows.Count)
+                            }
+                            else {
+                                Write-LanZBrowserDiag ('model metadata waiting rows={0}' -f $metadataRows.Count)
+                            }
+                        }
+                    }
+                }
+                catch {
+                    # Model metadata is optional. A page redesign may hide it while load
+                    # monitoring continues from the normal model response stream.
+                    Write-LanZBrowserDiag ('model metadata unavailable: {0}' -f $_.Exception.GetBaseException().Message)
+                }
+                finally {
+                    $state.ModelMetadataTask = $null
+                    $state.ModelMetadataNextAttemptUtc = if ($metadataReadSucceeded) {
+                        [DateTime]::UtcNow.AddMinutes(1)
+                    }
+                    else {
+                        [DateTime]::UtcNow.AddSeconds(2)
+                    }
+                }
+            }
+            if (-not $state.MonitorPanelReady -and $null -eq $state.PanelScriptTask -and [DateTime]::UtcNow -ge $state.PanelNextAttemptUtc) {
+                # 复现真实用户的一次性操作：打开右上角账户菜单，再进入
+                # “模型 API Key 申请”弹窗。弹窗自身每约 3 秒请求模型状态，
+                # 程序只监听这些页面响应，不自行构造模型请求。
+                $openPanelScript = @'
+(() => {
+  const account = document.querySelector('.agentHeader__right');
+  if (!account) return 'waiting-account';
+  account.click();
+  setTimeout(() => {
+    const item = Array.from(document.querySelectorAll('.agentHeader__operate'))
+      .find(el => (el.textContent || '').trim() === '模型 API Key 申请');
+    if (item) item.click();
+  }, 250);
+  return 'requested';
+})()
+'@
+                $state.PanelScriptTask = $script:BrowserView.CoreWebView2.ExecuteScriptAsync($openPanelScript)
+                $state.PanelNextAttemptUtc = [DateTime]::UtcNow.AddSeconds(2)
+            }
+
+            if ($state.MonitorPanelReady -and $null -eq $state.ModelMetadataTask -and [DateTime]::UtcNow -ge $state.ModelMetadataNextAttemptUtc) {
+                # Read the optional upstream-model label from the model-name cell's
+                # secondary block. No provider/model name is matched here: future labels
+                # are accepted as data, and an absent block simply produces an empty value.
+                $modelMetadataScript = @'
+(() => {
+  const clean = value => (value || '').replace(/\s+/g, ' ').trim();
+  return Array.from(document.querySelectorAll('table tbody tr')).map(row => {
+    const cells = row.querySelectorAll('td');
+    if (cells.length < 2) return null;
+    const box = cells[1].querySelector('.api__dialog__box');
+    if (!box || !box.firstElementChild) return null;
+
+    const primary = box.firstElementChild.cloneNode(true);
+    primary.querySelectorAll('.el-tag, [class*="tag"], [class*="children"]').forEach(node => node.remove());
+    const productName = clean(primary.textContent);
+    const detail = box.querySelector('.api__dialog__children') ||
+      Array.from(box.children).slice(1).find(node => clean(node.textContent));
+    return productName ? {
+      ProductName: productName,
+      ActualModel: detail ? clean(detail.textContent) : ''
+    } : null;
+  }).filter(Boolean);
+})()
+'@
+                $state.ModelMetadataTask = $script:BrowserView.CoreWebView2.ExecuteScriptAsync($modelMetadataScript)
+                Write-LanZBrowserDiag 'model metadata read scheduled'
+            }
+
+            # 正常弹窗约每 3 秒产生一个模型响应。连续 15 秒没有数据时只
+            # 重载真实主页面并重新打开弹窗，不再使用 HttpClient 模型兜底。
+            $lastBrowserDataUtc = $script:BrowserLastModelsUtc
+            $browserDataStale = $lastBrowserDataUtc -eq [DateTime]::MinValue -or ([DateTime]::UtcNow - $lastBrowserDataUtc).TotalSeconds -ge $script:BrowserReloadSeconds
+            $reloadDue = ([DateTime]::UtcNow - $state.LastNavigationUtc).TotalSeconds -ge $script:BrowserReloadSeconds
+            if ($browserDataStale -and $reloadDue) {
+                $state.MonitorPanelReady = $false
+                $state.ModelMetadataTask = $null
+                $script:BrowserView.CoreWebView2.Reload()
+                $state.LastNavigationUtc = [DateTime]::UtcNow
+            }
+        }
+    }
+    catch {
+        $state.Stage = 'error'
+        Write-LanZBrowserDiag ('capture step failed: {0}' -f $_.Exception.GetBaseException().Message)
+        $updatedText.Text = '浏览器同步等待重新验证'
+        $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#E6A23C')
+    }
+}
+
+function Stop-LanZBrowserCapture {
+    if ($null -ne $script:BrowserCaptureTimer) {
+        $script:BrowserCaptureTimer.Stop()
+    }
+    $script:BrowserResponseQueue.Clear()
+    if ($null -ne $script:BrowserView) {
+        try { $script:BrowserView.Dispose() } catch { }
+        $script:BrowserView = $null
+    }
+    if ($null -ne $script:BrowserCaptureWindow) {
+        try { $script:BrowserCaptureWindow.Close() } catch { }
+        $script:BrowserCaptureWindow = $null
+    }
+    $script:BrowserCaptureState = $null
+}
+
+function Start-LanZBrowserCapture {
+    param([switch]$Restart)
+
+    if ($Restart) {
+        Stop-LanZBrowserCapture
+    }
+    if ($null -ne $script:BrowserCaptureState -or -not $autoRefreshToggle.IsChecked) {
+        return
+    }
+
+    try {
+        [void](Import-LanZWebView2Runtime)
+        $dashboardUri = [Uri][string]$script:UsageDashboardUrl
+        $monitorUri = [Uri]::new($dashboardUri.GetLeftPart([UriPartial]::Authority) + '/')
+        $modelUri = [Uri][string]$script:Endpoint
+        $usageUri = [Uri][string]$script:UsageEndpoint
+        if ($dashboardUri.Host -ne $modelUri.Host -or $dashboardUri.Host -ne $usageUri.Host) {
+            throw '资源看板与数据接口必须位于同一服务域。'
+        }
+
+        $captureWindow = [Windows.Window]::new()
+        $captureWindow.Title = 'LanZ Browser Sync'
+        $captureWindow.Width = 2
+        $captureWindow.Height = 2
+        $captureWindow.Left = -32000
+        $captureWindow.Top = -32000
+        $captureWindow.ShowInTaskbar = $false
+        $captureWindow.ShowActivated = $false
+        $captureWindow.WindowStyle = [Windows.WindowStyle]::ToolWindow
+        $captureWindow.ResizeMode = [Windows.ResizeMode]::NoResize
+        $captureWindow.Opacity = 0
+
+        $captureView = [Microsoft.Web.WebView2.Wpf.WebView2]::new()
+        $creationProperties = [Microsoft.Web.WebView2.Wpf.CoreWebView2CreationProperties]::new()
+        $creationProperties.UserDataFolder = Join-Path $env:LOCALAPPDATA 'LanZMonitor\WebView2'
+        $captureView.CreationProperties = $creationProperties
+        $captureWindow.Content = $captureView
+        $script:BrowserCaptureWindow = $captureWindow
+        $script:BrowserView = $captureView
+        $script:BrowserCaptureState = @{
+            Stage = 'ensure'
+            EnsureTask = $null
+            NavigationUri = $dashboardUri.AbsoluteUri
+            MonitorUri = $monitorUri.AbsoluteUri
+            EndpointHost = $dashboardUri.Host
+            ModelPath = $modelUri.AbsolutePath
+            UsagePath = $usageUri.AbsolutePath
+            CookieName = [string]$script:SessionCookieName
+            ResponseHandler = $null
+            NavigationHandler = $null
+            SignedOut = $false
+            AtMonitorPage = $false
+            MonitorPanelReady = $false
+            PanelScriptTask = $null
+            PanelNextAttemptUtc = [DateTime]::MinValue
+            ModelMetadataTask = $null
+            ModelMetadataNextAttemptUtc = [DateTime]::MinValue
+            BootstrapDeadlineUtc = [DateTime]::UtcNow.AddSeconds(10)
+            LastNavigationUtc = [DateTime]::UtcNow
+            FirstCaptureLogged = $false
+        }
+        $script:BrowserLastModelsUtc = [DateTime]::MinValue
+        $script:BrowserLastUsageUtc = [DateTime]::MinValue
+        $captureWindow.Show()
+        $script:BrowserCaptureState.EnsureTask = $captureView.EnsureCoreWebView2Async()
+        $script:BrowserCaptureTimer.Start()
+        Write-LanZBrowserDiag 'capture window started'
+    }
+    catch {
+        Write-LanZBrowserDiag ('capture start failed: {0}' -f $_.Exception.GetBaseException().Message)
+        Stop-LanZBrowserCapture
+        $updatedText.Text = '浏览器同步不可用，请重新验证'
+        $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#E6A23C')
+    }
+}
+
+function Write-LanZBrowserDiag {
+    param([Parameter(Mandatory)][string]$Message)
+
+    try {
+        # 仅写阶段、路径和状态；不记录 URL 查询、Cookie、Token 或响应正文。
+        $line = '[{0}] {1}{2}' -f [DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss.fff'), $Message, [Environment]::NewLine
+        [IO.File]::AppendAllText($script:BrowserDiagLog, $line, [Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        # 诊断失败不影响主功能。
+    }
+}
+
+function Show-LanZMainWindow {
+    param([switch]$Pin)
+
+    if ($Pin) {
+        $pinToggle.IsChecked = $true
+    }
+    if ($window.WindowState -eq [Windows.WindowState]::Minimized) {
+        $window.WindowState = [Windows.WindowState]::Normal
+    }
+    $window.Show()
+    [void]$window.Activate()
+    $window.Topmost = [bool]$pinToggle.IsChecked
+}
+
+function Hide-LanZMainWindow {
+    $settingsPopup.IsOpen = $false
+    $window.Hide()
+}
+
+function Initialize-LanZTrayIcon {
+    if ($null -ne $script:TrayIcon) {
+        return
+    }
+
+    $notifyIcon = [Windows.Forms.NotifyIcon]::new()
+    $notifyIcon.Text = 'LanZ 负载监控'
+    try {
+        $processPath = [Environment]::GetCommandLineArgs()[0]
+        $script:TrayOwnedIcon = [Drawing.Icon]::ExtractAssociatedIcon($processPath)
+        if ($null -ne $script:TrayOwnedIcon) {
+            $notifyIcon.Icon = $script:TrayOwnedIcon
+        }
+        else {
+            $notifyIcon.Icon = [Drawing.SystemIcons]::Application
+        }
+    }
+    catch {
+        $notifyIcon.Icon = [Drawing.SystemIcons]::Application
+    }
+
+    $contextMenu = [Windows.Forms.ContextMenuStrip]::new()
+    $pinMenu = [Windows.Forms.ToolStripMenuItem]::new('窗口置顶')
+    $pinMenu.CheckOnClick = $true
+    $pinMenu.Checked = [bool]$pinToggle.IsChecked
+    $exitMenu = [Windows.Forms.ToolStripMenuItem]::new('退出')
+
+    $pinMenu.Add_Click({
+        $requested = [bool]$pinMenu.Checked
+        [void]$window.Dispatcher.BeginInvoke([Action]{
+            $pinToggle.IsChecked = $requested
+            if ($requested) {
+                Show-LanZMainWindow -Pin
+            }
+        }.GetNewClosure())
+    }.GetNewClosure())
+    $exitMenu.Add_Click({
+        [void]$window.Dispatcher.BeginInvoke([Action]{
+            $script:ExitRequested = $true
+            $window.Close()
+        })
+    }.GetNewClosure())
+    $notifyIcon.Add_DoubleClick({
+        [void]$window.Dispatcher.BeginInvoke([Action]{
+            if ($window.IsVisible) {
+                Hide-LanZMainWindow
+            }
+            else {
+                Show-LanZMainWindow
+            }
+        })
+    }.GetNewClosure())
+
+    [void]$contextMenu.Items.Add($pinMenu)
+    [void]$contextMenu.Items.Add([Windows.Forms.ToolStripSeparator]::new())
+    [void]$contextMenu.Items.Add($exitMenu)
+    $notifyIcon.ContextMenuStrip = $contextMenu
+    $script:TrayIcon = $notifyIcon
+    $script:TrayContextMenu = $contextMenu
+    $script:TrayPinMenu = $pinMenu
+    # Icon 和菜单都就绪后再显示，避免 NotifyIcon 在初始化中途
+    # 进入 shell，从而使 WPF Loaded 事件中断。
+    $notifyIcon.Visible = $true
+}
+
+function Dispose-LanZTrayIcon {
+    if ($null -ne $script:TrayIcon) {
+        $script:TrayIcon.Visible = $false
+        $script:TrayIcon.Dispose()
+        $script:TrayIcon = $null
+    }
+    if ($null -ne $script:TrayContextMenu) {
+        $script:TrayContextMenu.Dispose()
+        $script:TrayContextMenu = $null
+    }
+    if ($null -ne $script:TrayOwnedIcon) {
+        $script:TrayOwnedIcon.Dispose()
+        $script:TrayOwnedIcon = $null
+    }
+    $script:TrayPinMenu = $null
+}
+
 function Show-LanZLogin {
     param([switch]$ClearExistingSession)
 
@@ -1552,36 +2512,28 @@ function Show-LanZLogin {
     $script:LoginWindowOpen = $true
     $script:SuppressAutoLogin = $false
     $timer.Stop()
+    Stop-LanZBrowserCapture
 
     try {
         $loginNavigationUri = $null
         if (-not [Uri]::TryCreate([string]$script:UsageDashboardUrl, [UriKind]::Absolute, [ref]$loginNavigationUri) -or $loginNavigationUri.Scheme -ne 'https') {
             throw '资源看板地址无效，请重新配置连接信息。'
         }
-
-        $webViewDirectory = Join-Path $script:RuntimeDirectory 'WebView2'
-        $runtimeFilesReady = @(
-            'Microsoft.Web.WebView2.Core.dll',
-            'Microsoft.Web.WebView2.Wpf.dll',
-            'WebView2Loader.dll'
-        ) | ForEach-Object { Test-Path -LiteralPath (Join-Path $webViewDirectory $_) }
-        if ($runtimeFilesReady -contains $false) {
-            $webViewDirectory = Join-Path $script:AppDirectory 'lib\WebView2'
+        # 延迟事件回调使用闭包局部变量，避免在 ps2exe/WPF 闭包中读取
+        # $script: 变量时出现路径不可见，导致诊断日志静默失败。
+        $loginDiagPath = [IO.Path]::GetFullPath([string]$script:LoginDiagLog)
+        $loginDiagEncoding = [Text.UTF8Encoding]::new($false)
+        $loginSessionCookieName = [string]$script:SessionCookieName
+        $loginHost = $loginNavigationUri.Host
+        $loginHostParts = @($loginHost.Split('.') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $loginDomainSuffix = if ($loginHostParts.Count -ge 2) {
+            '.' + ($loginHostParts[($loginHostParts.Count - 2)..($loginHostParts.Count - 1)] -join '.')
         }
-        $coreAssembly = Join-Path $webViewDirectory 'Microsoft.Web.WebView2.Core.dll'
-        $wpfAssembly = Join-Path $webViewDirectory 'Microsoft.Web.WebView2.Wpf.dll'
-        $loaderAssembly = Join-Path $webViewDirectory 'WebView2Loader.dll'
-        if (-not (Test-Path -LiteralPath $coreAssembly) -or -not (Test-Path -LiteralPath $wpfAssembly) -or -not (Test-Path -LiteralPath $loaderAssembly)) {
-            throw '缺少 WebView2 登录组件，请重新解压完整项目。'
+        else {
+            '.' + $loginHost
         }
 
-        $env:PATH = "$webViewDirectory;$env:PATH"
-        if ($null -eq ('Microsoft.Web.WebView2.Core.CoreWebView2Environment' -as [type])) {
-            Add-Type -Path $coreAssembly
-        }
-        if ($null -eq ('Microsoft.Web.WebView2.Wpf.WebView2' -as [type])) {
-            Add-Type -Path $wpfAssembly
-        }
+        [void](Import-LanZWebView2Runtime)
 
         [xml]$loginXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -1613,7 +2565,12 @@ function Show-LanZLogin {
 
         $loginReader = [System.Xml.XmlNodeReader]::new($loginXaml)
         $loginWindow = [Windows.Markup.XamlReader]::Load($loginReader)
-        $loginWindow.Owner = $window
+        if ($window.IsVisible) {
+            $loginWindow.Owner = $window
+        }
+        else {
+            $loginWindow.WindowStartupLocation = [Windows.WindowStartupLocation]::CenterScreen
+        }
         $browserHost = $loginWindow.FindName('BrowserHost')
         $loginStatusText = $loginWindow.FindName('LoginStatusText')
         $loginCloseButton = $loginWindow.FindName('LoginCloseButton')
@@ -1631,9 +2588,20 @@ function Show-LanZLogin {
             CookieTask = $null
             NavigationUri = $loginNavigationUri.AbsoluteUri
             LastCandidate = ''
+            LastCandidateAttemptAt = [DateTime]::MinValue
             LastCookiePoll = [DateTime]::MinValue
+            NavCompletedAt = $null
+            NoSessionPrompted = $false
+            NavigationRetryCount = 0
+            NetworkDiagCount = 0
+            LastCookieSummary = ''
+            LastCookieDiagAt = [DateTime]::MinValue
+            LastDiagAt = [DateTime]::MinValue
             Success = $false
         }
+        try {
+            [IO.File]::AppendAllText($loginDiagPath, ("[{0}] === login window open === cookieName='{1}' navUri='{2}' clearExisting={3}`n" -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $script:SessionCookieName, $loginState.NavigationUri, [bool]$ClearExistingSession), $loginDiagEncoding)
+        } catch { }
         $loginTimer = [Windows.Threading.DispatcherTimer]::new()
         $loginTimer.Interval = [TimeSpan]::FromMilliseconds(250)
 
@@ -1641,6 +2609,7 @@ function Show-LanZLogin {
             try {
                 $loginState.EnsureTask = $webView.EnsureCoreWebView2Async()
                 $loginTimer.Start()
+                try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] window loaded, EnsureCoreWebView2Async started' -f [DateTime]::Now.ToString('HH:mm:ss.fff')) + "`n", $loginDiagEncoding) } catch { }
             }
             catch {
                 $loginStatusText.Text = '验证窗口异常：' + $_.Exception.Message
@@ -1650,19 +2619,44 @@ function Show-LanZLogin {
 
         $webView.add_NavigationCompleted(({
             param($sender, $eventArgs)
+            $safeSource = ''
+            try {
+                $source = [string]$webView.CoreWebView2.Source
+                if (-not [string]::IsNullOrWhiteSpace($source)) {
+                    $safeSource = ($source -replace '[?#].*$', '')
+                }
+            }
+            catch { }
+            try {
+                [IO.File]::AppendAllText(
+                    $loginDiagPath,
+                    ('[{0}] navigation completed success={1} error={2} source={3}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), [bool]$eventArgs.IsSuccess, [string]$eventArgs.WebErrorStatus, $safeSource) + "`n",
+                    $loginDiagEncoding
+                )
+            }
+            catch { }
             if (-not $eventArgs.IsSuccess) {
                 $loginStatusText.Text = '登录页面加载失败：' + [string]$eventArgs.WebErrorStatus
                 $loginState.Stage = 'error'
+            }
+            elseif ($null -eq $loginState.NavCompletedAt) {
+                # 只记录首次导航完成时间,避免 SSO 重定向多次刷新导致 15 秒计时重置。
+                $loginState.NavCompletedAt = [DateTime]::UtcNow
             }
         }).GetNewClosure())
 
         $loginTimer.Add_Tick(({
             try {
+                if (([DateTime]::UtcNow - $loginState.LastDiagAt).TotalSeconds -ge 10) {
+                    $loginState.LastDiagAt = [DateTime]::UtcNow
+                    try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] tick stage={1} ensure={2} cookieTask={3}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $loginState.Stage, ($null -ne $loginState.EnsureTask), ($null -ne $loginState.CookieTask)) + "`n", $loginDiagEncoding) } catch { }
+                }
                 if ($loginState.Stage -eq 'ensure') {
                     if (-not $loginState.EnsureTask.IsCompleted) {
                         return
                     }
                     if ($loginState.EnsureTask.IsFaulted) {
+                        try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] EnsureTask FAULTED: {1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $loginState.EnsureTask.Exception.GetBaseException().Message) + "`n", $loginDiagEncoding) } catch { }
                         throw $loginState.EnsureTask.Exception.GetBaseException()
                     }
                     $webView.CoreWebView2.Settings.AreDevToolsEnabled = $false
@@ -1671,12 +2665,73 @@ function Show-LanZLogin {
                     $webView.CoreWebView2.Settings.IsGeneralAutofillEnabled = $true
                     $webView.CoreWebView2.Profile.IsPasswordAutosaveEnabled = $true
                     $webView.CoreWebView2.Profile.IsGeneralAutofillEnabled = $true
+                    # 只记录登录跳转的脱敏网络摘要,用于确认 SSO 回跳是否真正给资源域
+                    # 设置了会话 Cookie。绝不记录 Cookie 值、请求头或查询参数值。
+                    $webView.CoreWebView2.add_WebResourceResponseReceived(({
+                        param($sender, $eventArgs)
+                        try {
+                            if ($loginState.NetworkDiagCount -ge 160) {
+                                return
+                            }
+                            $response = $eventArgs.Response
+                            $uri = [Uri][string]$eventArgs.Request.Uri
+                            $isRelatedHost = $uri.Host -eq $loginHost -or $uri.Host.EndsWith($loginDomainSuffix, [StringComparison]::OrdinalIgnoreCase)
+                            if (-not $isRelatedHost) {
+                                return
+                            }
+                            $statusCode = [int]$response.StatusCode
+                            $setCookieNames = @()
+                            try {
+                                $iterator = $response.Headers.GetHeaders('Set-Cookie')
+                                while ($iterator.MoveNext()) {
+                                    $line = [string]$iterator.Current.Value
+                                    if ($line -match '^\s*([^=;\s]+)\s*=') {
+                                        $setCookieNames += [string]$matches[1]
+                                    }
+                                }
+                            }
+                            catch { }
+                            $path = $uri.GetLeftPart([UriPartial]::Path)
+                            $locationPath = ''
+                            try {
+                                $location = [string]$response.Headers.GetHeader('Location')
+                                if (-not [string]::IsNullOrWhiteSpace($location)) {
+                                    $locationUri = $null
+                                    if ([Uri]::TryCreate($location, [UriKind]::Absolute, [ref]$locationUri)) {
+                                        $locationPath = $locationUri.GetLeftPart([UriPartial]::Path)
+                                    }
+                                }
+                            }
+                            catch { }
+                            $interesting = $statusCode -in @(301, 302, 303, 307, 308, 401, 403) -or $setCookieNames.Count -gt 0 -or $uri.AbsolutePath -match '/(login|resource/dashboard|v1/(openai/models|ai-resource/dashboard))'
+                            if ($interesting) {
+                                $loginState.NetworkDiagCount++
+                                $cookieSummary = if ($setCookieNames.Count -gt 0) { ($setCookieNames | Select-Object -Unique) -join ',' } else { '' }
+                                [IO.File]::AppendAllText(
+                                    $loginDiagPath,
+                                    ('[{0}] response status={1} path={2} location={3} setCookieNames={4}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $statusCode, $path, $locationPath, $cookieSummary) + "`n",
+                                    $loginDiagEncoding
+                                )
+                            }
+                        }
+                        catch { }
+                    }).GetNewClosure())
+                    $webView.CoreWebView2.AddWebResourceRequestedFilter('*', [Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext]::All)
                     if ($ClearExistingSession) {
                         $webView.CoreWebView2.CookieManager.DeleteAllCookies()
+                    }
+                    else {
+                        # 自动重新验证时保留 SSO Cookie,但删除上次未授权时留下的
+                        # nsession_id=0。否则资源域可能继续把它当作现有会话而不在
+                        # SSO 回跳时重新签发有效的 nsession_id。
+                        $webView.CoreWebView2.CookieManager.DeleteCookies($loginSessionCookieName, $loginState.NavigationUri)
+                        $webView.CoreWebView2.CookieManager.DeleteCookiesWithDomainAndPath($loginSessionCookieName, $loginNavigationUri.Host, '/')
+                        try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] cleared session cookie only; kept SSO cookies' -f [DateTime]::Now.ToString('HH:mm:ss.fff')) + "`n", $loginDiagEncoding) } catch { }
                     }
                     $webView.CoreWebView2.Navigate($loginState.NavigationUri)
                     $loginStatusText.Text = '请在资源看板完成登录；若页面提供保存密码提示可自行选择，程序只保存会话 Cookie。'
                     $loginState.Stage = 'cookies'
+                    try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] stage ensure->cookies, navigated' -f [DateTime]::Now.ToString('HH:mm:ss.fff')) + "`n", $loginDiagEncoding) } catch { }
                     return
                 }
 
@@ -1686,34 +2741,105 @@ function Show-LanZLogin {
 
                 if ($null -ne $loginState.CookieTask -and $loginState.CookieTask.IsCompleted) {
                     if ($loginState.CookieTask.IsFaulted) {
+                        try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] CookieTask FAULTED: {1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $loginState.CookieTask.Exception.GetBaseException().Message) + "`n", $loginDiagEncoding) } catch { }
                         throw $loginState.CookieTask.Exception.GetBaseException()
                     }
                     $cookies = $loginState.CookieTask.GetAwaiter().GetResult()
                     $loginState.CookieTask = $null
-                    $candidate = $cookies | Where-Object { $_.Name -eq $script:SessionCookieName -and $_.Value -ne '0' } | Select-Object -First 1
-                    if ($null -ne $candidate -and $candidate.Value -ne $loginState.LastCandidate) {
+                    # 诊断日志只记录 cookie 状态变化，或每 10 秒写一次心跳。
+                    # 不写完整 value，避免泄露凭据或因每秒轮询导致日志膨胀。
+                    try {
+                        $cookieSummaryParts = @()
+                        foreach ($c in $cookies) {
+                            $cookieValue = [string]$c.Value
+                            $isZero = ($cookieValue -eq '0')
+                            $cookieSummaryParts += ('name={0} domain={1} path={2} valLen={3} isZero={4}' -f [string]$c.Name, [string]$c.Domain, [string]$c.Path, $cookieValue.Length, $isZero)
+                        }
+                        $summaryKey = [string]::Join('|', [string[]]$cookieSummaryParts)
+                        $diagDue = $summaryKey -ne [string]$loginState.LastCookieSummary -or ([DateTime]::UtcNow - $loginState.LastCookieDiagAt).TotalSeconds -ge 10
+                        if ($diagDue) {
+                            $loginState.LastCookieSummary = $summaryKey
+                            $loginState.LastCookieDiagAt = [DateTime]::UtcNow
+                            $diagText = @('[{0}] poll count={1} uri={2}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), @($cookies).Count, $loginState.NavigationUri)
+                            $diagText += $cookieSummaryParts | ForEach-Object { '  ' + $_ }
+                            [IO.File]::AppendAllText($loginDiagPath, ([string]::Join([Environment]::NewLine, [string[]]$diagText) + [Environment]::NewLine), $loginDiagEncoding)
+                        }
+                    }
+                    catch {
+                        try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] COOKIE DIAG ERROR: {1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $_.Exception.Message) + [Environment]::NewLine, $loginDiagEncoding) } catch { }
+                    }
+                    $validCandidates = @($cookies | Where-Object { $_.Name -eq $loginSessionCookieName -and -not [string]::IsNullOrWhiteSpace([string]$_.Value) -and $_.Value -ne '0' })
+                    $candidate = $validCandidates | Where-Object { ([string]$_.Domain).TrimStart('.') -eq $loginNavigationUri.Host } | Select-Object -First 1
+                    if ($null -eq $candidate) {
+                        $candidate = $validCandidates | Select-Object -First 1
+                    }
+                    $candidateChanged = $null -ne $candidate -and [string]$candidate.Value -ne [string]$loginState.LastCandidate
+                    $candidateRetryDue = $null -ne $candidate -and -not $candidateChanged -and ([DateTime]::UtcNow - $loginState.LastCandidateAttemptAt).TotalSeconds -ge 10
+                    if ($null -ne $candidate -and ($candidateChanged -or $candidateRetryDue)) {
                         $loginState.LastCandidate = $candidate.Value
+                        $loginState.LastCandidateAttemptAt = [DateTime]::UtcNow
                         $loginStatusText.Text = '检测到新会话，正在验证…'
                         try {
                             [void](Get-LanZModels -SessionValue $candidate.Value)
                             Save-LanZSessionValue -SessionValue $candidate.Value
                             $loginState.Success = $true
                             $loginStatusText.Text = '验证成功。'
+                            try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] VERIFY OK saved valLen={1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), ([string]$candidate.Value).Length) + "`n", $loginDiagEncoding) } catch { }
                             $loginWindow.Close()
                             return
                         }
                         catch [System.UnauthorizedAccessException] {
-                            $loginStatusText.Text = '当前会话尚未生效，请继续完成登录。'
+                            try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] VERIFY FAIL UnauthorizedAccess: {1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $_.Exception.Message) + "`n", $loginDiagEncoding) } catch { }
+                            # 保留 WebView2 的 SSO Cookie。候选值在 10 秒后允许重试,
+                            # 但不清空整个 Cookie 存储,避免把刚完成的 SSO 登录态删掉。
+                            $loginStatusText.Text = '当前会话尚未被服务接受，请继续完成登录。'
+                        }
+                        catch {
+                            try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] VERIFY FAIL other: {1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $_.Exception.Message) + "`n", $loginDiagEncoding) } catch { }
+                            # 其他异常(如网络错误)不卡死,继续轮询等待 cookie 更新。
+                            $loginStatusText.Text = '会话尚未生效，请完成登录后等待自动验证。'
+                        }
+                    }
+                    elseif ($null -eq $candidate -and -not $loginState.NoSessionPrompted -and $null -ne $loginState.NavCompletedAt) {
+                        # nsession_id 一直是 '0' 或不存在。看板页可能靠 Windows 集成认证
+                        # 加载(显示欢迎回来),但 API 需要的 nsession_id 需要用户主动登录
+                        # 才会生成。导航完成 15 秒后仍无有效会话,提示用户主动登录。
+                        if (([DateTime]::UtcNow - $loginState.NavCompletedAt).TotalSeconds -ge 15) {
+                            $canRetryDashboardNavigation = $false
+                            try {
+                                $currentSourceUri = [Uri][string]$webView.CoreWebView2.Source
+                                $canRetryDashboardNavigation = $currentSourceUri.Host -eq $loginNavigationUri.Host -and $currentSourceUri.AbsolutePath -eq ([Uri][string]$loginState.NavigationUri).AbsolutePath
+                            }
+                            catch { }
+                            if ($canRetryDashboardNavigation -and $loginState.NavigationRetryCount -lt 2) {
+                                # SSO 页面显示欢迎信息后,资源域有时仍保留初始的
+                                # nsession_id=0。仅在当前确实已经回到看板时重载,
+                                # 避免用户正在 SSO 输入密码时丢失表单内容。
+                                $loginState.NavigationRetryCount++
+                                $loginState.NavCompletedAt = $null
+                                $loginState.NoSessionPrompted = $false
+                                $loginState.LastCookiePoll = [DateTime]::MinValue
+                                $loginStatusText.Text = '已完成登录，正在重新同步资源看板会话…'
+                                try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] dashboard reload retry={1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $loginState.NavigationRetryCount) + "`n", $loginDiagEncoding) } catch { }
+                                $webView.CoreWebView2.Navigate($loginState.NavigationUri)
+                            }
+                            else {
+                                $loginState.NoSessionPrompted = $true
+                                $loginStatusText.Text = '未检测到有效会话，请在页面中完成登录（输入账号密码）后等待自动验证。'
+                            }
                         }
                     }
                 }
 
                 if ($null -eq $loginState.CookieTask -and ([DateTime]::UtcNow - $loginState.LastCookiePoll).TotalSeconds -ge 1) {
                     $loginState.LastCookiePoll = [DateTime]::UtcNow
-                    $loginState.CookieTask = $webView.CoreWebView2.CookieManager.GetCookiesAsync($loginState.NavigationUri)
+                    # 传入 null 表示读取当前 WebView2 profile 的全部 Cookie,
+                    # 避免按 dashboard 的 URI 过滤掉 SSO 域名或不同 path 下的 nsession_id。
+                    $loginState.CookieTask = $webView.CoreWebView2.CookieManager.GetCookiesAsync([string]$null)
                 }
             }
             catch {
+                try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] TICK EXCEPTION: {1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $_.Exception.Message) + "`n", $loginDiagEncoding) } catch { }
                 $loginStatusText.Text = '验证窗口异常：' + $_.Exception.Message
                 $loginState.Stage = 'error'
             }
@@ -1729,8 +2855,14 @@ function Show-LanZLogin {
             $script:LoginWindowOpen = $false
             if ($loginState.Success) {
                 $script:SuppressAutoLogin = $false
+                $autoWasChecked = [bool]$autoRefreshToggle.IsChecked
                 $autoRefreshToggle.IsChecked = $true
-                Update-Widget
+                # 登录窗与后台监听共用同一 WebView2 profile。登录成功后重新
+                # 建立监听页面，让后续负载来自资源看板自身的网络响应。
+                Start-LanZBrowserCapture -Restart
+                if ($autoWasChecked) {
+                    Update-Widget
+                }
                 $timer.Start()
             }
             else {
@@ -1770,20 +2902,28 @@ function Set-LanZRefreshError {
     if ($isUnauthorized) {
         $timer.Stop()
         if (-not $script:SuppressAutoLogin) {
+            # 保留 WebView2 的 SSO 登录态(不清 cookie),让用户在登录窗里
+            # 重新触发登录流程以生成新的 nsession_id。清 cookie 会丢失
+            # SSO 登录态,导致看板页虽能加载但 nsession_id 一直是 '0'。
             Show-LanZLogin
         }
     }
 }
 
 function Start-LanZRefresh {
+    param([switch]$MetadataOnly)
+
     if ($script:RefreshInProgress) {
         return
     }
 
     try {
         $sessionValue = Get-LanZSessionValue
+        Import-LanZRefreshCadence
         $functionNames = @(
             'New-LanZRequestToken',
+            'Add-LanZBrowserHeaders',
+            'ConvertTo-LanZModels',
             'Get-LanZModels',
             'Get-LanZUsageOverview',
             'Get-LanZAuthenticatedText',
@@ -1799,7 +2939,14 @@ function Start-LanZRefresh {
 param(
     [object]$Configuration,
     [string]$SessionValue,
-    [string]$BillingRulesPath
+    [object]$HttpClient,
+    [string]$BillingRulesPath,
+    [string]$BillingOverridesPath,
+    [string]$LastUsageFetchUtc,
+    [string]$LastBillingFetchUtc,
+    [int]$UsageRefreshSeconds,
+    [int]$BillingRefreshSeconds,
+    [bool]$FetchModels
 )
 
 Set-StrictMode -Version Latest
@@ -1811,16 +2958,53 @@ $global:UsageEndpoint = [string]$Configuration.UsageEndpoint
 $global:UsageDashboardUrl = [string]$Configuration.UsageDashboardUrl
 $global:SessionCookieName = [string]$Configuration.SessionCookieName
 $global:BillingRulesPath = $BillingRulesPath
+$global:BillingOverridesPath = $BillingOverridesPath
 $global:BillingRules = $null
+$global:UsageRefreshSeconds = $UsageRefreshSeconds
+$global:BillingRefreshSeconds = $BillingRefreshSeconds
+# 决定本次是否低频调用。首次(无记录)强制调用一次以建立基线。
+$global:ShouldFetchUsage = $true
+$global:ShouldFetchBilling = $true
+if (-not [string]::IsNullOrWhiteSpace($LastUsageFetchUtc)) {
+    try {
+        $lastUsage = [DateTime]::Parse($LastUsageFetchUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        if (([DateTime]::UtcNow - $lastUsage).TotalSeconds -lt $UsageRefreshSeconds) {
+            $global:ShouldFetchUsage = $false
+        }
+    } catch { }
+}
+if (-not [string]::IsNullOrWhiteSpace($LastBillingFetchUtc)) {
+    try {
+        $lastBilling = [DateTime]::Parse($LastBillingFetchUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        if (([DateTime]::UtcNow - $lastBilling).TotalSeconds -lt $BillingRefreshSeconds) {
+            $global:ShouldFetchBilling = $false
+        }
+    } catch { }
+}
 '@
         $workerTail = @'
-$models = @(Get-LanZModels -SessionValue $SessionValue)
-$usageOverview = Get-LanZUsageOverview -SessionValue $SessionValue
-$billingRules = Get-LanZBillingRules -SessionValue $SessionValue
+$models = @()
+if ($FetchModels) {
+    $models = @(Get-LanZModels -SessionValue $SessionValue -HttpClient $HttpClient)
+}
+$usageOverview = $null
+$usageRefreshed = $false
+if ($global:ShouldFetchUsage) {
+    $usageOverview = Get-LanZUsageOverview -SessionValue $SessionValue -HttpClient $HttpClient
+    $usageRefreshed = $true
+}
+$billingRules = $null
+$billingRefreshed = $false
+if ($global:ShouldFetchBilling) {
+    $billingRules = Get-LanZBillingRules -SessionValue $SessionValue -HttpClient $HttpClient
+    $billingRefreshed = $true
+}
 [pscustomobject]@{
     Models = $models
     UsageOverview = $usageOverview
     BillingRules = $billingRules
+    UsageRefreshed = $usageRefreshed
+    BillingRefreshed = $billingRefreshed
 }
 '@
 
@@ -1834,7 +3018,16 @@ $billingRules = Get-LanZBillingRules -SessionValue $SessionValue
         [void]$worker.AddScript($workerScript)
         [void]$worker.AddArgument($script:Configuration)
         [void]$worker.AddArgument($sessionValue)
+        [void]$worker.AddArgument($script:SharedHttpClient)
         [void]$worker.AddArgument($script:BillingRulesPath)
+        [void]$worker.AddArgument($script:BillingOverridesPath)
+        $lastUsageArg = if ($script:LastUsageFetchUtc -ne [DateTime]::MinValue) { $script:LastUsageFetchUtc.ToString('o') } else { '' }
+        $lastBillingArg = if ($script:LastBillingFetchUtc -ne [DateTime]::MinValue) { $script:LastBillingFetchUtc.ToString('o') } else { '' }
+        [void]$worker.AddArgument($lastUsageArg)
+        [void]$worker.AddArgument($lastBillingArg)
+        [void]$worker.AddArgument([int]$script:UsageRefreshSeconds)
+        [void]$worker.AddArgument([int]$script:BillingRefreshSeconds)
+        [void]$worker.AddArgument([bool](-not $MetadataOnly))
         $script:RefreshWorker = [pscustomobject]@{
             PowerShell = $worker
             Handle = $worker.BeginInvoke()
@@ -1872,20 +3065,45 @@ function Complete-LanZRefresh {
             throw '刷新没有返回可用数据。'
         }
         $models = @($result.Models)
+        $hasModelData = $models.Count -gt 0
+        # 用量按低频节奏刷新;未刷新时沿用上次快照,避免用量卡片空白。
         $usageOverview = $result.UsageOverview
-        $script:BillingRules = $result.BillingRules
-        $modelsWithHistory = @(Add-LanZChartHistory -Models $models)
-        $script:DisplayedModels = @(Sort-LanZModels -Models $modelsWithHistory)
-        $modelsList.ItemsSource = $script:DisplayedModels
-        $usageCard.DataContext = New-LanZQuotaViewModel -Overview $usageOverview -BillingRules $script:BillingRules
-        try {
-            Save-LanZStatusSnapshot -Models $models -Overview $usageOverview
+        if ($null -eq $usageOverview -and $null -ne $script:BrowserUsage) {
+            $usageOverview = $script:BrowserUsage
         }
-        catch {
-            # The live widget remains authoritative if local snapshot persistence fails.
+        if ($null -eq $usageOverview -and $null -ne $script:CachedStatusSnapshot) {
+            $usageOverview = $script:CachedStatusSnapshot.Usage
         }
-        $updatedText.Text = '已更新 ' + (Get-Date).ToString('HH:mm:ss')
-        $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
+        # 规则同理:未刷新时保留内存中已同步的规则。
+        if ($null -ne $result.BillingRules) {
+            $script:BillingRules = $result.BillingRules
+        }
+        if ($hasModelData) {
+            $script:BrowserModels = $models
+            $modelsWithHistory = @(Add-LanZChartHistory -Models $models)
+            $script:DisplayedModels = @(Sort-LanZModels -Models $modelsWithHistory)
+            $modelsList.ItemsSource = $script:DisplayedModels
+        }
+        if ($null -ne $usageOverview) {
+            $script:BrowserUsage = $usageOverview
+        }
+        Update-LanZLocalQuotaStatus
+        $snapshotModels = if ($hasModelData) { $models } else { @($script:BrowserModels) }
+        if ($snapshotModels.Count -gt 0 -and $null -ne $usageOverview) {
+            try {
+                Save-LanZStatusSnapshot -Models $snapshotModels -Overview $usageOverview
+            }
+            catch {
+                # The live widget remains authoritative if local snapshot persistence fails.
+            }
+        }
+        # 记录低频调用节奏:只有真正发起了请求才更新对应时间戳。
+        Save-LanZRefreshCadence -UsageUpdated:([bool]$result.UsageRefreshed) -BillingUpdated:([bool]$result.BillingRefreshed)
+        if ($hasModelData) {
+            $script:LastSuccessfulModelRefreshUtc = [DateTime]::UtcNow
+            $updatedText.Text = '已更新 ' + (Get-Date).ToString('HH:mm:ss')
+            $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
+        }
     }
     catch {
         Set-LanZRefreshError -Exception $_.Exception
@@ -1896,7 +3114,37 @@ function Complete-LanZRefresh {
 }
 
 function Update-Widget {
-    Start-LanZRefresh
+    param([switch]$Force)
+
+    # 每个 3 秒节拍都用已缓存规则和当前本地时间重算显示；不访问网络。
+    Update-LanZLocalQuotaStatus
+
+    if ($Force) {
+        # 手动刷新也只操作真实 WebView2 页面，不调用模型接口。
+        if ($null -ne $script:BrowserView -and $null -ne $script:BrowserView.CoreWebView2) {
+            if ($null -ne $script:BrowserCaptureState) {
+                $script:BrowserCaptureState.MonitorPanelReady = $false
+                $script:BrowserCaptureState.LastNavigationUtc = [DateTime]::UtcNow
+            }
+            $script:BrowserView.CoreWebView2.Reload()
+        }
+        else {
+            Start-LanZBrowserCapture -Restart
+        }
+    }
+
+    # 当日额度与计费规则仍按 2 分钟/4 小时低频同步；该后台任务明确
+    # 跳过模型接口，且不设置伪造或自定义 User-Agent。
+    $usageDue = $script:LastUsageFetchUtc -eq [DateTime]::MinValue -or ([DateTime]::UtcNow - $script:LastUsageFetchUtc).TotalSeconds -ge $script:UsageRefreshSeconds
+    $billingDue = $script:LastBillingFetchUtc -eq [DateTime]::MinValue -or ([DateTime]::UtcNow - $script:LastBillingFetchUtc).TotalSeconds -ge $script:BillingRefreshSeconds
+    if ($usageDue -or $billingDue) {
+        Start-LanZRefresh -MetadataOnly
+    }
+}
+
+function Set-LanZJitteredInterval {
+    # 跟随模型申请弹窗实测的约 3 秒页面轮询节奏。
+    $timer.Interval = [TimeSpan]::FromSeconds([int]$RefreshSeconds)
 }
 
 function Show-LanZCachedStatus {
@@ -1913,6 +3161,7 @@ function Show-LanZCachedStatus {
             [pscustomobject]@{
                 Name = [string]$_.Name
                 ModelId = [string]$_.ModelId
+                ActualModel = if ($null -ne $_.PSObject.Properties['ActualModel']) { [string]$_.ActualModel } else { '' }
                 Active = [int]$_.Active
                 Capacity = [int]$_.Capacity
                 Percent = [int]$_.Percent
@@ -1978,13 +3227,19 @@ function Save-LanZUiPreferences {
 }
 
 $timer = [Windows.Threading.DispatcherTimer]::new()
-$timer.Interval = [TimeSpan]::FromSeconds($RefreshSeconds)
-$timer.Add_Tick({ Update-Widget })
+Set-LanZJitteredInterval
+$timer.Add_Tick({
+    Update-Widget
+    Set-LanZJitteredInterval
+})
 $refreshPollTimer = [Windows.Threading.DispatcherTimer]::new()
 $refreshPollTimer.Interval = [TimeSpan]::FromMilliseconds(120)
 $refreshPollTimer.Add_Tick({ Complete-LanZRefresh })
+$script:BrowserCaptureTimer = [Windows.Threading.DispatcherTimer]::new()
+$script:BrowserCaptureTimer.Interval = [TimeSpan]::FromMilliseconds(120)
+$script:BrowserCaptureTimer.Add_Tick({ Step-LanZBrowserCapture })
 $startupTimer = [Windows.Threading.DispatcherTimer]::new()
-$startupTimer.Interval = [TimeSpan]::FromMilliseconds(80)
+$startupTimer.Interval = [TimeSpan]::FromSeconds(5)
 $startupTimer.Add_Tick({
     $startupTimer.Stop()
     Update-Widget
@@ -1992,10 +3247,11 @@ $startupTimer.Add_Tick({
         $timer.Start()
     }
 })
-$refreshButton.Add_Click({ Update-Widget })
+$refreshButton.Add_Click({ Update-Widget -Force })
 $autoRefreshToggle.Add_Checked({
     Save-LanZUiPreferences
     $script:SuppressAutoLogin = $false
+    Start-LanZBrowserCapture
     Update-Widget
     if ($autoRefreshToggle.IsChecked -and -not $script:LoginWindowOpen) {
         $timer.Start()
@@ -2004,6 +3260,7 @@ $autoRefreshToggle.Add_Checked({
 $autoRefreshToggle.Add_Unchecked({
     Save-LanZUiPreferences
     $timer.Stop()
+    Stop-LanZBrowserCapture
     if (-not $script:LoginWindowOpen) {
         $updatedText.Text = '自动刷新已暂停'
         $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
@@ -2034,10 +3291,16 @@ $lineChartToggle.Add_Checked({
 $pinToggle.Add_Checked({
     $window.Topmost = $true
     $pinToggle.ToolTip = '已置顶，点击取消'
+    if ($null -ne $script:TrayPinMenu) {
+        $script:TrayPinMenu.Checked = $true
+    }
 })
 $pinToggle.Add_Unchecked({
     $window.Topmost = $false
     $pinToggle.ToolTip = '未置顶，点击置顶'
+    if ($null -ne $script:TrayPinMenu) {
+        $script:TrayPinMenu.Checked = $false
+    }
 })
 $modelsList.Add_PreviewMouseLeftButtonDown({
     $model = Get-LanZModelFromVisual -Visual $_.OriginalSource
@@ -2096,6 +3359,7 @@ $modelsList.Add_Drop({
     $visibleOrder.Insert($newIndex, $sourceId)
 
     $script:ModelOrder.Clear()
+    $script:ModelOrderUserDefined = $true
     foreach ($modelId in $visibleOrder) {
         $script:ModelOrder.Add($modelId)
     }
@@ -2110,7 +3374,7 @@ $modelsList.Add_Drop({
     $modelsList.ItemsSource = $script:DisplayedModels
     $_.Handled = $true
 })
-$closeButton.Add_Click({ $window.Close() })
+$closeButton.Add_Click({ Hide-LanZMainWindow })
 $window.Add_PreviewMouseLeftButtonDown({
     if ($_.ChangedButton -ne [Windows.Input.MouseButton]::Left) {
         return
@@ -2141,6 +3405,12 @@ $window.Add_PreviewMouseLeftButtonDown({
         $window.DragMove()
     }
 })
+$window.Add_Closing({
+    if (-not $script:ExitRequested -and [string]::IsNullOrWhiteSpace($ScreenshotPath) -and [string]::IsNullOrWhiteSpace($SettingsScreenshotPath)) {
+        $_.Cancel = $true
+        Hide-LanZMainWindow
+    }
+})
 $window.Add_Loaded({
     Update-LanZQuotaVisibility
     Show-LanZCachedStatus
@@ -2163,10 +3433,19 @@ $window.Add_Loaded({
             if (-not [string]::IsNullOrWhiteSpace($SettingsScreenshotPath)) {
                 Export-LanZWindowScreenshot -TargetWindow $settingsPopup.Child -Path $SettingsScreenshotPath
             }
+            $script:ExitRequested = $true
             $window.Close()
         }.GetNewClosure())
         $screenshotTimer.Start()
         return
+    }
+    try {
+        Initialize-LanZTrayIcon
+        Start-LanZBrowserCapture
+    }
+    catch {
+        $updatedText.Text = '托盘初始化失败，主窗口仍可使用'
+        $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#E6A23C')
     }
     $startupTimer.Start()
 })
@@ -2174,6 +3453,8 @@ $window.Add_Closed({
     $startupTimer.Stop()
     $timer.Stop()
     $refreshPollTimer.Stop()
+    Stop-LanZBrowserCapture
+    Dispose-LanZTrayIcon
     if ($null -ne $script:RefreshWorker) {
         try {
             $script:RefreshWorker.PowerShell.Stop()
@@ -2187,9 +3468,19 @@ $window.Add_Closed({
     }
 })
 
-[void]$window.ShowDialog()
+$application = [Windows.Application]::new()
+$application.ShutdownMode = [Windows.ShutdownMode]::OnMainWindowClose
+[void]$application.Run($window)
 }
 finally {
+    if ($null -ne $script:SharedHttpClient) {
+        $script:SharedHttpClient.Dispose()
+        $script:SharedHttpClient = $null
+    }
+    if ($null -ne $script:SharedHttpHandler) {
+        $script:SharedHttpHandler.Dispose()
+        $script:SharedHttpHandler = $null
+    }
     $singleInstanceMutex.ReleaseMutex()
     $singleInstanceMutex.Dispose()
 }
