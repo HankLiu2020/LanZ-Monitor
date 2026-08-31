@@ -8,6 +8,10 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:AppVersion = '1.4.1'
+$script:UpdateRepository = 'HankLiu2020/LanZ-Monitor'
+$script:UpdateManifestUrl = "https://github.com/$($script:UpdateRepository)/releases/latest/download/latest.txt"
+$script:UpdateReleaseUrl = "https://github.com/$($script:UpdateRepository)/releases/latest"
 
 $scriptRootValue = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
     $PSScriptRoot
@@ -30,7 +34,6 @@ foreach ($directory in @($script:SecretsDirectory, $script:DataDirectory, $scrip
     [void][IO.Directory]::CreateDirectory($directory)
 }
 $script:SessionPath = Join-Path $script:SecretsDirectory 'session.bin'
-$script:ConfigPath = Join-Path $script:SecretsDirectory 'connection.bin'
 $script:LoginWindowOpen = $false
 $script:SuppressAutoLogin = $false
 $script:LoadHistory = @{}
@@ -44,9 +47,8 @@ $script:BillingRulesPath = Join-Path $script:SettingsDirectory 'billing-rules.js
 $script:BillingOverridesPath = Join-Path $script:SettingsDirectory 'billing-overrides.json'
 $script:CadencePath = Join-Path $script:SettingsDirectory 'refresh-cadence.json'
 $script:BillingRules = $null
-# 用量与规则的低频刷新间隔(秒)。模型负载以 WebView2 看板响应为主，
-# 当日用量两分钟一次、积分规则四小时一次，避免高频直连调用。
-$script:UsageRefreshSeconds = 120
+# 模型负载与当日用量都来自 WebView2 看板响应；只有计费规则
+# 采用四小时一次的低频读取，避免高频直连调用。
 $script:BillingRefreshSeconds = 14400
 $script:LastUsageFetchUtc = [DateTime]::MinValue
 $script:LastBillingFetchUtc = [DateTime]::MinValue
@@ -90,13 +92,19 @@ $script:ExitRequested = $false
 $script:TrayIcon = $null
 $script:TrayContextMenu = $null
 $script:TrayPinMenu = $null
+$script:TrayExitMenu = $null
 $script:TrayOwnedIcon = $null
+$script:TrayPinHandler = $null
+$script:TrayExitHandler = $null
+$script:TrayDoubleClickHandler = $null
 $script:SharedHttpHandler = $null
 $script:SharedHttpClient = $null
+$script:UpdateWorker = $null
+$script:UpdateInProgress = $false
+$script:PendingUpdate = $null
 
 $legacyStateFiles = [ordered]@{
     '.lanz-session.bin' = $script:SessionPath
-    '.lanz-config.bin' = $script:ConfigPath
     '.lanz-history.json' = $script:HistoryPath
     '.lanz-status.jsonl' = $script:StatusLogPath
     '.lanz-ui.json' = $script:UiPreferencesPath
@@ -166,47 +174,19 @@ catch {
 
 Add-Type -AssemblyName System.Security
 Add-Type -AssemblyName System.Net.Http
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
 
-function Get-LanZConfiguration {
-    if (-not (Test-Path -LiteralPath $script:ConfigPath)) {
-        throw '未找到连接配置。请先运行 setup-session.cmd。'
-    }
-
-    $protectedBytes = [System.IO.File]::ReadAllBytes($script:ConfigPath)
-    $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
-        $protectedBytes,
-        $null,
-        [System.Security.Cryptography.DataProtectionScope]::CurrentUser
-    )
-    $configuration = [System.Text.Encoding]::UTF8.GetString($plainBytes) | ConvertFrom-Json
-
-    foreach ($propertyName in @('ApiEndpoint', 'UsageEndpoint', 'UsageDashboardUrl', 'LoginUrl', 'SessionCookieName', 'RequestTokenHeader', 'RequestTokenPrefix', 'RequestTokenKey', 'RequestTokenIV', 'SuccessCode', 'UnauthorizedCode')) {
-        if ($null -eq $configuration.PSObject.Properties[$propertyName]) {
-            throw "连接配置缺少 $propertyName，请重新运行 setup-session.cmd。"
-        }
-    }
-
-    $apiUri = $null
-    $loginUri = $null
-    if (-not [Uri]::TryCreate([string]$configuration.ApiEndpoint, [UriKind]::Absolute, [ref]$apiUri) -or $apiUri.Scheme -ne 'https') {
-        throw 'API 地址必须是有效的 HTTPS URL。'
-    }
-    $usageUri = $null
-    if (-not [Uri]::TryCreate([string]$configuration.UsageEndpoint, [UriKind]::Absolute, [ref]$usageUri) -or $usageUri.Scheme -ne 'https') {
-        throw '用量 API 地址必须是有效的 HTTPS URL。'
-    }
-    $usageDashboardUri = $null
-    if (-not [Uri]::TryCreate([string]$configuration.UsageDashboardUrl, [UriKind]::Absolute, [ref]$usageDashboardUri) -or $usageDashboardUri.Scheme -ne 'https') {
-        throw '资源看板地址必须是有效的 HTTPS URL。'
-    }
-    if (-not [Uri]::TryCreate([string]$configuration.LoginUrl, [UriKind]::Absolute, [ref]$loginUri) -or $loginUri.Scheme -ne 'https') {
-        throw '登录地址必须是有效的 HTTPS URL。'
-    }
-
-    return $configuration
+$script:Configuration = [pscustomobject][ordered]@{
+    ApiEndpoint = 'https://lanz.hikvision.com/v1/openai/models'
+    UsageEndpoint = 'https://lanz.hikvision.com/v1/ai-resource/dashboard'
+    UsageDashboardUrl = 'https://lanz.hikvision.com/resource/dashboard'
+    LoginUrl = 'https://lanz.hikvision.com/'
+    SessionCookieName = 'nsession_id'
+    SuccessCode = 2001
+    UnauthorizedCode = 3001
 }
-
-$script:Configuration = Get-LanZConfiguration
 $script:Endpoint = [string]$script:Configuration.ApiEndpoint
 $script:UsageEndpoint = [string]$script:Configuration.UsageEndpoint
 $script:UsageDashboardUrl = [string]$script:Configuration.UsageDashboardUrl
@@ -219,7 +199,7 @@ function Get-LanZSessionValue {
     }
 
     if (-not (Test-Path -LiteralPath $script:SessionPath)) {
-        throw '未找到会话凭据。请先运行 setup-session.cmd。'
+        throw [System.UnauthorizedAccessException]::new('未找到有效会话，需要在内置登录窗口中完成验证。')
     }
 
     $protectedBytes = [System.IO.File]::ReadAllBytes($script:SessionPath)
@@ -251,37 +231,13 @@ function Save-LanZSessionValue {
     [System.IO.File]::WriteAllBytes($script:SessionPath, $protectedBytes)
 }
 
-function New-LanZRequestToken {
-    $aes = [System.Security.Cryptography.Aes]::Create()
-    try {
-        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
-        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
-        $aes.Key = [System.Text.Encoding]::UTF8.GetBytes([string]$script:Configuration.RequestTokenKey)
-        $aes.IV = [System.Text.Encoding]::UTF8.GetBytes([string]$script:Configuration.RequestTokenIV)
-
-        $plainText = [string]$script:Configuration.RequestTokenPrefix + [guid]::NewGuid().ToString() + '_' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-        $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($plainText)
-        $encryptor = $aes.CreateEncryptor()
-        try {
-            $encryptedBytes = $encryptor.TransformFinalBlock($plainBytes, 0, $plainBytes.Length)
-            return [Convert]::ToBase64String($encryptedBytes)
-        }
-        finally {
-            $encryptor.Dispose()
-        }
-    }
-    finally {
-        $aes.Dispose()
-    }
-}
-
 function Add-LanZBrowserHeaders {
     param(
         [Parameter(Mandatory)][System.Net.Http.HttpRequestMessage]$Request,
         [switch]$ForScript
     )
 
-    # 仅供额度与计费规则的低频同步使用。模型负载只监听页面自身请求。
+    # 仅供计费规则的低频看板读取使用。模型负载和额度只监听页面自身请求。
     # 不手工设置 User-Agent，也不伪造 Sec-Fetch/Client-Hints。
     $accept = if ($ForScript) { '*/*' } else { 'application/json, text/plain, */*' }
     [void]$Request.Headers.TryAddWithoutValidation('Accept', $accept)
@@ -355,141 +311,6 @@ function ConvertTo-LanZModels {
     })
 }
 
-function Get-LanZModels {
-    param(
-        [string]$SessionValue,
-        [System.Net.Http.HttpClient]$HttpClient
-    )
-
-    if ([string]::IsNullOrWhiteSpace($SessionValue)) {
-        $SessionValue = Get-LanZSessionValue
-    }
-    $ownsClient = $null -eq $HttpClient
-    $handler = $null
-    if ($ownsClient) {
-        $handler = [System.Net.Http.HttpClientHandler]::new()
-        # 内网 TLS 代理的证书链在当前 Windows 环境无法查到 CRL，
-        # 强制启用会以 RevocationStatusUnknown 拒绝所有请求。这里仅关闭
-        # 吊销列表查询；.NET 仍会执行主机名、有效期和证书链校验。
-        $handler.CheckCertificateRevocationList = $false
-        $handler.UseCookies = $false
-        $HttpClient = [System.Net.Http.HttpClient]::new($handler)
-        $HttpClient.Timeout = [TimeSpan]::FromSeconds(8)
-    }
-    $request = [System.Net.Http.HttpRequestMessage]::new(
-        [System.Net.Http.HttpMethod]::Get,
-        $script:Endpoint
-    )
-    $response = $null
-
-    try {
-        [void]$request.Headers.TryAddWithoutValidation('Cookie', "$($script:SessionCookieName)=$SessionValue")
-        [void]$request.Headers.TryAddWithoutValidation([string]$script:Configuration.RequestTokenHeader, (New-LanZRequestToken))
-        Add-LanZBrowserHeaders -Request $request
-        $response = $HttpClient.SendAsync($request).GetAwaiter().GetResult()
-        $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-
-        if (-not $response.IsSuccessStatusCode) {
-            if ([int]$response.StatusCode -in @(401, 403)) {
-                throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
-            }
-            throw "服务返回 HTTP $([int]$response.StatusCode)"
-        }
-
-        # 会话失效时服务端可能返回 200 + HTML 登录页而非 JSON。检测到 HTML
-        # 时视为未授权,抛 UnauthorizedAccessException 以触发登录窗口。
-        $trimmed = $content.TrimStart()
-        if ($trimmed.Length -gt 0 -and $trimmed[0] -eq '<') {
-            throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
-        }
-
-        $payload = $content | ConvertFrom-Json
-        if ([int]$payload.code -ne [int]$script:Configuration.SuccessCode) {
-            if ([int]$payload.code -eq [int]$script:Configuration.UnauthorizedCode) {
-                throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
-            }
-            throw "接口错误：$($payload.msg)"
-        }
-
-        return @(ConvertTo-LanZModels -Data @($payload.data))
-    }
-    finally {
-        if ($null -ne $response) {
-            $response.Dispose()
-        }
-        $request.Dispose()
-        if ($ownsClient) {
-            $HttpClient.Dispose()
-            $handler.Dispose()
-        }
-    }
-}
-
-function Get-LanZUsageOverview {
-    param(
-        [string]$SessionValue,
-        [System.Net.Http.HttpClient]$HttpClient
-    )
-
-    if ([string]::IsNullOrWhiteSpace($SessionValue)) {
-        $SessionValue = Get-LanZSessionValue
-    }
-    $ownsClient = $null -eq $HttpClient
-    $handler = $null
-    if ($ownsClient) {
-        $handler = [System.Net.Http.HttpClientHandler]::new()
-        # 见 Get-LanZModels 中的 CRL 兼容说明；不改写服务器证书验证回调。
-        $handler.CheckCertificateRevocationList = $false
-        $handler.UseCookies = $false
-        $HttpClient = [System.Net.Http.HttpClient]::new($handler)
-        $HttpClient.Timeout = [TimeSpan]::FromSeconds(8)
-    }
-    $request = [System.Net.Http.HttpRequestMessage]::new(
-        [System.Net.Http.HttpMethod]::Get,
-        $script:UsageEndpoint
-    )
-    $response = $null
-
-    try {
-        [void]$request.Headers.TryAddWithoutValidation('Cookie', "$($script:SessionCookieName)=$SessionValue")
-        [void]$request.Headers.TryAddWithoutValidation([string]$script:Configuration.RequestTokenHeader, (New-LanZRequestToken))
-        Add-LanZBrowserHeaders -Request $request
-        $response = $HttpClient.SendAsync($request).GetAwaiter().GetResult()
-        $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-        if (-not $response.IsSuccessStatusCode) {
-            if ([int]$response.StatusCode -in @(401, 403)) {
-                throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
-            }
-            throw "用量服务返回 HTTP $([int]$response.StatusCode)"
-        }
-
-        # 会话失效时服务端可能返回 200 + HTML 登录页而非 JSON。
-        $trimmed = $content.TrimStart()
-        if ($trimmed.Length -gt 0 -and $trimmed[0] -eq '<') {
-            throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
-        }
-
-        $payload = $content | ConvertFrom-Json
-        if ([int]$payload.code -ne [int]$script:Configuration.SuccessCode) {
-            if ([int]$payload.code -eq [int]$script:Configuration.UnauthorizedCode) {
-                throw [System.UnauthorizedAccessException]::new('会话已过期，需要重新验证。')
-            }
-            throw "用量接口错误：$($payload.msg)"
-        }
-        return $payload.data.overview
-    }
-    finally {
-        if ($null -ne $response) {
-            $response.Dispose()
-        }
-        $request.Dispose()
-        if ($ownsClient) {
-            $HttpClient.Dispose()
-            $handler.Dispose()
-        }
-    }
-}
-
 function Get-LanZAuthenticatedText {
     param(
         [Parameter(Mandatory)][Uri]$Uri,
@@ -501,7 +322,8 @@ function Get-LanZAuthenticatedText {
     $handler = $null
     if ($ownsClient) {
         $handler = [System.Net.Http.HttpClientHandler]::new()
-        # 见 Get-LanZModels 中的 CRL 兼容说明；不改写服务器证书验证回调。
+        # 当前内网 TLS 代理无法可靠查询 CRL；这里只关闭吊销列表查询，
+        # 不改写服务器证书回调，主机名、有效期和证书链仍由 .NET 校验。
         $handler.CheckCertificateRevocationList = $false
         $handler.UseCookies = $false
         $HttpClient = [System.Net.Http.HttpClient]::new($handler)
@@ -910,11 +732,14 @@ function Update-LanZLocalQuotaStatus {
 }
 
 if ($Once) {
-    Get-LanZModels | Select-Object Name, ModelId, Active, Capacity, Percent, Available | ConvertTo-Json -Depth 3
+    if (-not (Test-Path -LiteralPath $script:LatestStatusPath)) {
+        throw '尚无本地状态快照，请先正常启动一次应用并完成登录。'
+    }
+    Get-Content -LiteralPath $script:LatestStatusPath -Raw -Encoding UTF8
     exit 0
 }
 
-# HttpClient 仅用于额度与计费规则的低频同步，模型负载不使用它。
+# HttpClient 仅用于计费规则的低频看板读取，模型负载和额度不使用它。
 # 复用连接池和 TLS 会话，避免每次低频同步都新建 handler/连接。
 $script:SharedHttpHandler = [System.Net.Http.HttpClientHandler]::new()
 $script:SharedHttpHandler.CheckCertificateRevocationList = $false
@@ -1816,6 +1641,8 @@ function Export-LanZWindowScreenshot {
                         </StackPanel>
                         <Separator Margin="0,7,0,7" Background="#E7ECEF"/>
                         <Button x:Name="LoginButton" Content="重新登录 / 切换凭据" Height="29" FontSize="11" Foreground="#5A47E5" Background="#F0EEFF" BorderBrush="#D9D3FF" Cursor="Hand"/>
+                        <Button x:Name="UpdateButton" Content="检查更新" Height="29" Margin="0,7,0,0" FontSize="11" Foreground="#356A5A" Background="#EAF7F2" BorderBrush="#BCE4D4" Cursor="Hand"/>
+                        <TextBlock x:Name="UpdateStatusText" Text="当前版本 v1.4.1" Margin="2,6,2,0" FontSize="9" Foreground="#87949E" TextWrapping="Wrap"/>
                     </StackPanel>
                 </Border>
             </Popup>
@@ -1847,6 +1674,8 @@ $lineChartToggle = $window.FindName('LineChartToggle')
 $settingsButton = $window.FindName('SettingsButton')
 $settingsPopup = $window.FindName('SettingsPopup')
 $loginButton = $window.FindName('LoginButton')
+$updateButton = $window.FindName('UpdateButton')
+$updateStatusText = $window.FindName('UpdateStatusText')
 $autoRefreshToggle.IsChecked = [bool]$script:UiPreferences.AutoRefresh
 $showExternalQuotaToggle.IsChecked = [bool]$script:UiPreferences.ShowExternalQuota
 $showInternalQuotaToggle.IsChecked = [bool]$script:UiPreferences.ShowInternalQuota
@@ -2393,6 +2222,11 @@ function Write-LanZBrowserDiag {
 
     try {
         # 仅写阶段、路径和状态；不记录 URL 查询、Cookie、Token 或响应正文。
+        if ((Test-Path -LiteralPath $script:BrowserDiagLog) -and (Get-Item -LiteralPath $script:BrowserDiagLog).Length -gt 1MB) {
+            $oldPath = $script:BrowserDiagLog + '.old'
+            if (Test-Path -LiteralPath $oldPath) { Remove-Item -LiteralPath $oldPath -Force }
+            Move-Item -LiteralPath $script:BrowserDiagLog -Destination $oldPath -Force
+        }
         $line = '[{0}] {1}{2}' -f [DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss.fff'), $Message, [Environment]::NewLine
         [IO.File]::AppendAllText($script:BrowserDiagLog, $line, [Text.UTF8Encoding]::new($false))
     }
@@ -2418,6 +2252,24 @@ function Show-LanZMainWindow {
 function Hide-LanZMainWindow {
     $settingsPopup.IsOpen = $false
     $window.Hide()
+}
+
+function Request-LanZExit {
+    if ($script:ExitRequested) {
+        return
+    }
+
+    $script:ExitRequested = $true
+    Write-LanZBrowserDiag 'tray exit requested'
+    try { $settingsPopup.IsOpen = $false } catch { }
+    $currentApplication = [Windows.Application]::Current
+    if ($null -ne $currentApplication) {
+        # Shutdown 会同时结束可能仍打开的登录窗口和隐藏的主窗口，
+        # 不依赖 Close/Closing 的“隐藏到托盘”分支。
+        $currentApplication.Shutdown()
+        return
+    }
+    $window.Close()
 }
 
 function Initialize-LanZTrayIcon {
@@ -2447,7 +2299,8 @@ function Initialize-LanZTrayIcon {
     $pinMenu.Checked = [bool]$pinToggle.IsChecked
     $exitMenu = [Windows.Forms.ToolStripMenuItem]::new('退出')
 
-    $pinMenu.Add_Click({
+    $pinHandlerBlock = {
+        param($sender, $eventArgs)
         $requested = [bool]$pinMenu.Checked
         [void]$window.Dispatcher.BeginInvoke([Action]{
             $pinToggle.IsChecked = $requested
@@ -2455,14 +2308,24 @@ function Initialize-LanZTrayIcon {
                 Show-LanZMainWindow -Pin
             }
         }.GetNewClosure())
-    }.GetNewClosure())
-    $exitMenu.Add_Click({
-        [void]$window.Dispatcher.BeginInvoke([Action]{
-            $script:ExitRequested = $true
-            $window.Close()
-        })
-    }.GetNewClosure())
-    $notifyIcon.Add_DoubleClick({
+    }.GetNewClosure()
+    $script:TrayPinHandler = [EventHandler]$pinHandlerBlock
+    $pinMenu.Add_Click($script:TrayPinHandler)
+
+    $exitHandlerBlock = {
+        param($sender, $eventArgs)
+        Write-LanZBrowserDiag 'tray exit click callback entered'
+        if ($window.Dispatcher.CheckAccess()) {
+            Request-LanZExit
+            return
+        }
+        [void]$window.Dispatcher.BeginInvoke([Action]{ Request-LanZExit }.GetNewClosure())
+    }.GetNewClosure()
+    $script:TrayExitHandler = [EventHandler]$exitHandlerBlock
+    $exitMenu.Add_Click($script:TrayExitHandler)
+
+    $doubleClickHandlerBlock = {
+        param($sender, $eventArgs)
         [void]$window.Dispatcher.BeginInvoke([Action]{
             if ($window.IsVisible) {
                 Hide-LanZMainWindow
@@ -2470,8 +2333,10 @@ function Initialize-LanZTrayIcon {
             else {
                 Show-LanZMainWindow
             }
-        })
-    }.GetNewClosure())
+        }.GetNewClosure())
+    }.GetNewClosure()
+    $script:TrayDoubleClickHandler = [EventHandler]$doubleClickHandlerBlock
+    $notifyIcon.Add_DoubleClick($script:TrayDoubleClickHandler)
 
     [void]$contextMenu.Items.Add($pinMenu)
     [void]$contextMenu.Items.Add([Windows.Forms.ToolStripSeparator]::new())
@@ -2480,12 +2345,22 @@ function Initialize-LanZTrayIcon {
     $script:TrayIcon = $notifyIcon
     $script:TrayContextMenu = $contextMenu
     $script:TrayPinMenu = $pinMenu
+    $script:TrayExitMenu = $exitMenu
     # Icon 和菜单都就绪后再显示，避免 NotifyIcon 在初始化中途
     # 进入 shell，从而使 WPF Loaded 事件中断。
     $notifyIcon.Visible = $true
 }
 
 function Dispose-LanZTrayIcon {
+    if ($null -ne $script:TrayPinMenu -and $null -ne $script:TrayPinHandler) {
+        $script:TrayPinMenu.Remove_Click($script:TrayPinHandler)
+    }
+    if ($null -ne $script:TrayExitMenu -and $null -ne $script:TrayExitHandler) {
+        $script:TrayExitMenu.Remove_Click($script:TrayExitHandler)
+    }
+    if ($null -ne $script:TrayIcon -and $null -ne $script:TrayDoubleClickHandler) {
+        $script:TrayIcon.Remove_DoubleClick($script:TrayDoubleClickHandler)
+    }
     if ($null -ne $script:TrayIcon) {
         $script:TrayIcon.Visible = $false
         $script:TrayIcon.Dispose()
@@ -2500,6 +2375,10 @@ function Dispose-LanZTrayIcon {
         $script:TrayOwnedIcon = $null
     }
     $script:TrayPinMenu = $null
+    $script:TrayExitMenu = $null
+    $script:TrayPinHandler = $null
+    $script:TrayExitHandler = $null
+    $script:TrayDoubleClickHandler = $null
 }
 
 function Show-LanZLogin {
@@ -2529,6 +2408,12 @@ function Show-LanZLogin {
         $loginDomainSuffix = if ($loginHostParts.Count -ge 2) {
             '.' + ($loginHostParts[($loginHostParts.Count - 2)..($loginHostParts.Count - 1)] -join '.')
         }
+
+        if ((Test-Path -LiteralPath $loginDiagPath) -and (Get-Item -LiteralPath $loginDiagPath).Length -gt 2MB) {
+            $oldLoginDiagPath = $loginDiagPath + '.old'
+            if (Test-Path -LiteralPath $oldLoginDiagPath) { Remove-Item -LiteralPath $oldLoginDiagPath -Force }
+            Move-Item -LiteralPath $loginDiagPath -Destination $oldLoginDiagPath -Force
+        }
         else {
             '.' + $loginHost
         }
@@ -2538,7 +2423,7 @@ function Show-LanZLogin {
         [xml]$loginXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="LanZ 重新验证" Width="980" Height="720"
+        Title="LanZ 登录" Width="980" Height="720"
         WindowStartupLocation="CenterOwner" Background="#F7F9FB">
     <Grid>
         <Grid.RowDefinitions>
@@ -2551,7 +2436,7 @@ function Show-LanZLogin {
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
             <StackPanel Margin="16,7,0,0">
-                <TextBlock Text="LanZ 身份验证" FontSize="15" FontWeight="SemiBold" Foreground="#293B49"/>
+                <TextBlock Text="登录 LanZ" FontSize="15" FontWeight="SemiBold" Foreground="#293B49"/>
                 <TextBlock x:Name="LoginStatusText" Text="正在加载登录页面…" FontSize="11" Foreground="#7E8D98" Margin="0,2,0,0"/>
             </StackPanel>
             <Button x:Name="LoginCloseButton" Grid.Column="1" Content="关闭" Margin="0,9,14,9" Padding="14,0" Background="#F3F5F7" BorderBrush="#DDE3E8" Foreground="#536675" Cursor="Hand"/>
@@ -2600,7 +2485,7 @@ function Show-LanZLogin {
             Success = $false
         }
         try {
-            [IO.File]::AppendAllText($loginDiagPath, ("[{0}] === login window open === cookieName='{1}' navUri='{2}' clearExisting={3}`n" -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $script:SessionCookieName, $loginState.NavigationUri, [bool]$ClearExistingSession), $loginDiagEncoding)
+            [IO.File]::AppendAllText($loginDiagPath, ("[{0}] === login window open === navUri='{1}' clearExisting={2}`n" -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $loginState.NavigationUri, [bool]$ClearExistingSession), $loginDiagEncoding)
         } catch { }
         $loginTimer = [Windows.Threading.DispatcherTimer]::new()
         $loginTimer.Interval = [TimeSpan]::FromMilliseconds(250)
@@ -2680,13 +2565,17 @@ function Show-LanZLogin {
                                 return
                             }
                             $statusCode = [int]$response.StatusCode
-                            $setCookieNames = @()
+                            $setCookieCount = 0
+                            $hasConfiguredSessionCookie = $false
                             try {
                                 $iterator = $response.Headers.GetHeaders('Set-Cookie')
                                 while ($iterator.MoveNext()) {
                                     $line = [string]$iterator.Current.Value
                                     if ($line -match '^\s*([^=;\s]+)\s*=') {
-                                        $setCookieNames += [string]$matches[1]
+                                        $setCookieCount++
+                                        if ([string]$matches[1] -eq $loginSessionCookieName) {
+                                            $hasConfiguredSessionCookie = $true
+                                        }
                                     }
                                 }
                             }
@@ -2703,13 +2592,12 @@ function Show-LanZLogin {
                                 }
                             }
                             catch { }
-                            $interesting = $statusCode -in @(301, 302, 303, 307, 308, 401, 403) -or $setCookieNames.Count -gt 0 -or $uri.AbsolutePath -match '/(login|resource/dashboard|v1/(openai/models|ai-resource/dashboard))'
+                            $interesting = $statusCode -in @(301, 302, 303, 307, 308, 401, 403) -or $setCookieCount -gt 0 -or $uri.AbsolutePath -match '/(login|resource/dashboard|v1/(openai/models|ai-resource/dashboard))'
                             if ($interesting) {
                                 $loginState.NetworkDiagCount++
-                                $cookieSummary = if ($setCookieNames.Count -gt 0) { ($setCookieNames | Select-Object -Unique) -join ',' } else { '' }
                                 [IO.File]::AppendAllText(
                                     $loginDiagPath,
-                                    ('[{0}] response status={1} path={2} location={3} setCookieNames={4}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $statusCode, $path, $locationPath, $cookieSummary) + "`n",
+                                    ('[{0}] response status={1} path={2} location={3} setCookieCount={4} hasSessionCookie={5}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $statusCode, $path, $locationPath, $setCookieCount, $hasConfiguredSessionCookie) + "`n",
                                     $loginDiagEncoding
                                 )
                             }
@@ -2722,8 +2610,8 @@ function Show-LanZLogin {
                     }
                     else {
                         # 自动重新验证时保留 SSO Cookie,但删除上次未授权时留下的
-                        # nsession_id=0。否则资源域可能继续把它当作现有会话而不在
-                        # SSO 回跳时重新签发有效的 nsession_id。
+                        # 无效会话 Cookie。否则资源域可能继续把它当作现有会话，
+                        # 不在 SSO 回跳时重新签发有效会话。
                         $webView.CoreWebView2.CookieManager.DeleteCookies($loginSessionCookieName, $loginState.NavigationUri)
                         $webView.CoreWebView2.CookieManager.DeleteCookiesWithDomainAndPath($loginSessionCookieName, $loginNavigationUri.Host, '/')
                         try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] cleared session cookie only; kept SSO cookies' -f [DateTime]::Now.ToString('HH:mm:ss.fff')) + "`n", $loginDiagEncoding) } catch { }
@@ -2750,10 +2638,11 @@ function Show-LanZLogin {
                     # 不写完整 value，避免泄露凭据或因每秒轮询导致日志膨胀。
                     try {
                         $cookieSummaryParts = @()
-                        foreach ($c in $cookies) {
+                        foreach ($c in @($cookies | Where-Object { $_.Name -eq $loginSessionCookieName })) {
                             $cookieValue = [string]$c.Value
                             $isZero = ($cookieValue -eq '0')
-                            $cookieSummaryParts += ('name={0} domain={1} path={2} valLen={3} isZero={4}' -f [string]$c.Name, [string]$c.Domain, [string]$c.Path, $cookieValue.Length, $isZero)
+                            $isDashboardHost = ([string]$c.Domain).TrimStart('.') -eq $loginNavigationUri.Host
+                            $cookieSummaryParts += ('sessionCookie valLen={0} isZero={1} dashboardHost={2}' -f $cookieValue.Length, $isZero, $isDashboardHost)
                         }
                         $summaryKey = [string]::Join('|', [string[]]$cookieSummaryParts)
                         $diagDue = $summaryKey -ne [string]$loginState.LastCookieSummary -or ([DateTime]::UtcNow - $loginState.LastCookieDiagAt).TotalSeconds -ge 10
@@ -2776,33 +2665,40 @@ function Show-LanZLogin {
                     $candidateChanged = $null -ne $candidate -and [string]$candidate.Value -ne [string]$loginState.LastCandidate
                     $candidateRetryDue = $null -ne $candidate -and -not $candidateChanged -and ([DateTime]::UtcNow - $loginState.LastCandidateAttemptAt).TotalSeconds -ge 10
                     if ($null -ne $candidate -and ($candidateChanged -or $candidateRetryDue)) {
+                        # 登录会话由资源看板自身签发。只有 WebView2 已经回到固定的
+                        # dashboard 页面时才接收非零 Cookie，避免在 SSO 中间跳转阶段
+                        # 误存临时值；不再为了“验证”额外调用签名模型接口。
+                        $dashboardReady = $false
+                        try {
+                            $currentSourceUri = [Uri][string]$webView.CoreWebView2.Source
+                            $dashboardReady = $currentSourceUri.Host -eq $loginNavigationUri.Host -and
+                                $currentSourceUri.AbsolutePath.TrimEnd('/') -eq $loginNavigationUri.AbsolutePath.TrimEnd('/')
+                        }
+                        catch { }
+                        if (-not $dashboardReady) {
+                            $loginStatusText.Text = '已检测到会话，正在等待资源看板完成跳转…'
+                            return
+                        }
+
                         $loginState.LastCandidate = $candidate.Value
                         $loginState.LastCandidateAttemptAt = [DateTime]::UtcNow
-                        $loginStatusText.Text = '检测到新会话，正在验证…'
+                        $loginStatusText.Text = '检测到有效会话，正在保存…'
                         try {
-                            [void](Get-LanZModels -SessionValue $candidate.Value)
                             Save-LanZSessionValue -SessionValue $candidate.Value
                             $loginState.Success = $true
                             $loginStatusText.Text = '验证成功。'
-                            try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] VERIFY OK saved valLen={1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), ([string]$candidate.Value).Length) + "`n", $loginDiagEncoding) } catch { }
+                            try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] SESSION SAVED dashboardReady=true valLen={1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), ([string]$candidate.Value).Length) + "`n", $loginDiagEncoding) } catch { }
                             $loginWindow.Close()
                             return
                         }
-                        catch [System.UnauthorizedAccessException] {
-                            try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] VERIFY FAIL UnauthorizedAccess: {1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $_.Exception.Message) + "`n", $loginDiagEncoding) } catch { }
-                            # 保留 WebView2 的 SSO Cookie。候选值在 10 秒后允许重试,
-                            # 但不清空整个 Cookie 存储,避免把刚完成的 SSO 登录态删掉。
-                            $loginStatusText.Text = '当前会话尚未被服务接受，请继续完成登录。'
-                        }
                         catch {
-                            try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] VERIFY FAIL other: {1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $_.Exception.Message) + "`n", $loginDiagEncoding) } catch { }
-                            # 其他异常(如网络错误)不卡死,继续轮询等待 cookie 更新。
-                            $loginStatusText.Text = '会话尚未生效，请完成登录后等待自动验证。'
+                            try { [IO.File]::AppendAllText($loginDiagPath, ('[{0}] SESSION SAVE FAIL: {1}' -f [DateTime]::Now.ToString('HH:mm:ss.fff'), $_.Exception.Message) + "`n", $loginDiagEncoding) } catch { }
+                            $loginStatusText.Text = '会话保存失败，请关闭窗口后重试。'
                         }
                     }
                     elseif ($null -eq $candidate -and -not $loginState.NoSessionPrompted -and $null -ne $loginState.NavCompletedAt) {
-                        # nsession_id 一直是 '0' 或不存在。看板页可能靠 Windows 集成认证
-                        # 加载(显示欢迎回来),但 API 需要的 nsession_id 需要用户主动登录
+                        # 配置的会话 Cookie 一直是 '0' 或不存在。看板页可能靠 Windows 集成认证
+                        # 加载(显示欢迎回来),但 API 需要的有效会话需要用户主动登录
                         # 才会生成。导航完成 15 秒后仍无有效会话,提示用户主动登录。
                         if (([DateTime]::UtcNow - $loginState.NavCompletedAt).TotalSeconds -ge 15) {
                             $canRetryDashboardNavigation = $false
@@ -2813,7 +2709,7 @@ function Show-LanZLogin {
                             catch { }
                             if ($canRetryDashboardNavigation -and $loginState.NavigationRetryCount -lt 2) {
                                 # SSO 页面显示欢迎信息后,资源域有时仍保留初始的
-                                # nsession_id=0。仅在当前确实已经回到看板时重载,
+                                # 无效会话值。仅在当前确实已经回到看板时重载,
                                 # 避免用户正在 SSO 输入密码时丢失表单内容。
                                 $loginState.NavigationRetryCount++
                                 $loginState.NavCompletedAt = $null
@@ -2834,7 +2730,7 @@ function Show-LanZLogin {
                 if ($null -eq $loginState.CookieTask -and ([DateTime]::UtcNow - $loginState.LastCookiePoll).TotalSeconds -ge 1) {
                     $loginState.LastCookiePoll = [DateTime]::UtcNow
                     # 传入 null 表示读取当前 WebView2 profile 的全部 Cookie,
-                    # 避免按 dashboard 的 URI 过滤掉 SSO 域名或不同 path 下的 nsession_id。
+                    # 避免按 dashboard 的 URI 过滤掉 SSO 域名或不同 path 下的会话 Cookie。
                     $loginState.CookieTask = $webView.CoreWebView2.CookieManager.GetCookiesAsync([string]$null)
                 }
             }
@@ -2903,16 +2799,14 @@ function Set-LanZRefreshError {
         $timer.Stop()
         if (-not $script:SuppressAutoLogin) {
             # 保留 WebView2 的 SSO 登录态(不清 cookie),让用户在登录窗里
-            # 重新触发登录流程以生成新的 nsession_id。清 cookie 会丢失
-            # SSO 登录态,导致看板页虽能加载但 nsession_id 一直是 '0'。
+            # 重新触发登录流程以生成新的会话 Cookie。清 cookie 会丢失
+            # SSO 登录态,导致看板页虽能加载但会话值一直是 '0'。
             Show-LanZLogin
         }
     }
 }
 
 function Start-LanZRefresh {
-    param([switch]$MetadataOnly)
-
     if ($script:RefreshInProgress) {
         return
     }
@@ -2921,11 +2815,7 @@ function Start-LanZRefresh {
         $sessionValue = Get-LanZSessionValue
         Import-LanZRefreshCadence
         $functionNames = @(
-            'New-LanZRequestToken',
             'Add-LanZBrowserHeaders',
-            'ConvertTo-LanZModels',
-            'Get-LanZModels',
-            'Get-LanZUsageOverview',
             'Get-LanZAuthenticatedText',
             'Import-LanZBillingRulesCache',
             'Get-LanZBillingRules'
@@ -2942,11 +2832,8 @@ param(
     [object]$HttpClient,
     [string]$BillingRulesPath,
     [string]$BillingOverridesPath,
-    [string]$LastUsageFetchUtc,
     [string]$LastBillingFetchUtc,
-    [int]$UsageRefreshSeconds,
-    [int]$BillingRefreshSeconds,
-    [bool]$FetchModels
+    [int]$BillingRefreshSeconds
 )
 
 Set-StrictMode -Version Latest
@@ -2960,19 +2847,9 @@ $global:SessionCookieName = [string]$Configuration.SessionCookieName
 $global:BillingRulesPath = $BillingRulesPath
 $global:BillingOverridesPath = $BillingOverridesPath
 $global:BillingRules = $null
-$global:UsageRefreshSeconds = $UsageRefreshSeconds
 $global:BillingRefreshSeconds = $BillingRefreshSeconds
-# 决定本次是否低频调用。首次(无记录)强制调用一次以建立基线。
-$global:ShouldFetchUsage = $true
+# 计费规则首次无缓存时同步一次，之后最多四小时读取一次看板规则。
 $global:ShouldFetchBilling = $true
-if (-not [string]::IsNullOrWhiteSpace($LastUsageFetchUtc)) {
-    try {
-        $lastUsage = [DateTime]::Parse($LastUsageFetchUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
-        if (([DateTime]::UtcNow - $lastUsage).TotalSeconds -lt $UsageRefreshSeconds) {
-            $global:ShouldFetchUsage = $false
-        }
-    } catch { }
-}
 if (-not [string]::IsNullOrWhiteSpace($LastBillingFetchUtc)) {
     try {
         $lastBilling = [DateTime]::Parse($LastBillingFetchUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
@@ -2983,16 +2860,6 @@ if (-not [string]::IsNullOrWhiteSpace($LastBillingFetchUtc)) {
 }
 '@
         $workerTail = @'
-$models = @()
-if ($FetchModels) {
-    $models = @(Get-LanZModels -SessionValue $SessionValue -HttpClient $HttpClient)
-}
-$usageOverview = $null
-$usageRefreshed = $false
-if ($global:ShouldFetchUsage) {
-    $usageOverview = Get-LanZUsageOverview -SessionValue $SessionValue -HttpClient $HttpClient
-    $usageRefreshed = $true
-}
 $billingRules = $null
 $billingRefreshed = $false
 if ($global:ShouldFetchBilling) {
@@ -3000,10 +2867,10 @@ if ($global:ShouldFetchBilling) {
     $billingRefreshed = $true
 }
 [pscustomobject]@{
-    Models = $models
-    UsageOverview = $usageOverview
+    Models = @()
+    UsageOverview = $null
     BillingRules = $billingRules
-    UsageRefreshed = $usageRefreshed
+    UsageRefreshed = $false
     BillingRefreshed = $billingRefreshed
 }
 '@
@@ -3021,13 +2888,9 @@ if ($global:ShouldFetchBilling) {
         [void]$worker.AddArgument($script:SharedHttpClient)
         [void]$worker.AddArgument($script:BillingRulesPath)
         [void]$worker.AddArgument($script:BillingOverridesPath)
-        $lastUsageArg = if ($script:LastUsageFetchUtc -ne [DateTime]::MinValue) { $script:LastUsageFetchUtc.ToString('o') } else { '' }
         $lastBillingArg = if ($script:LastBillingFetchUtc -ne [DateTime]::MinValue) { $script:LastBillingFetchUtc.ToString('o') } else { '' }
-        [void]$worker.AddArgument($lastUsageArg)
         [void]$worker.AddArgument($lastBillingArg)
-        [void]$worker.AddArgument([int]$script:UsageRefreshSeconds)
         [void]$worker.AddArgument([int]$script:BillingRefreshSeconds)
-        [void]$worker.AddArgument([bool](-not $MetadataOnly))
         $script:RefreshWorker = [pscustomobject]@{
             PowerShell = $worker
             Handle = $worker.BeginInvoke()
@@ -3133,12 +2996,11 @@ function Update-Widget {
         }
     }
 
-    # 当日额度与计费规则仍按 2 分钟/4 小时低频同步；该后台任务明确
-    # 跳过模型接口，且不设置伪造或自定义 User-Agent。
-    $usageDue = $script:LastUsageFetchUtc -eq [DateTime]::MinValue -or ([DateTime]::UtcNow - $script:LastUsageFetchUtc).TotalSeconds -ge $script:UsageRefreshSeconds
+    # 当日额度只来自真实 WebView2 页面响应。计费规则按 4 小时低频读取
+    # 已登录看板脚本；不调用模型或用量 API，也不需要 AES 请求令牌。
     $billingDue = $script:LastBillingFetchUtc -eq [DateTime]::MinValue -or ([DateTime]::UtcNow - $script:LastBillingFetchUtc).TotalSeconds -ge $script:BillingRefreshSeconds
-    if ($usageDue -or $billingDue) {
-        Start-LanZRefresh -MetadataOnly
+    if ($billingDue) {
+        Start-LanZRefresh
     }
 }
 
@@ -3226,6 +3088,461 @@ function Save-LanZUiPreferences {
     )
 }
 
+function Open-LanZReleasePage {
+    param([Parameter(Mandatory)][string]$Url)
+
+    $releaseUri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$releaseUri) -or
+        $releaseUri.Scheme -ne 'https' -or
+        $releaseUri.Host -ne 'github.com' -or
+        -not $releaseUri.AbsolutePath.StartsWith('/HankLiu2020/LanZ-Monitor/releases/', [StringComparison]::OrdinalIgnoreCase)) {
+        throw '更新页面地址未通过安全校验。'
+    }
+    Start-Process -FilePath $releaseUri.AbsoluteUri
+}
+
+function Start-LanZUpdateOperation {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Check', 'Download')][string]$Operation,
+        [object]$Release
+    )
+
+    if ($script:UpdateInProgress) {
+        return
+    }
+
+    $worker = [PowerShell]::Create()
+    try {
+        if ($Operation -eq 'Check') {
+            $checkScript = @'
+param($ManifestUrl, $Repository, $CurrentVersion)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Net.Http
+
+$manifestUri = [Uri]$ManifestUrl
+if ($manifestUri.Scheme -ne 'https' -or $manifestUri.Host -ne 'github.com' -or
+    $manifestUri.AbsolutePath -ne ('/' + $Repository + '/releases/latest/download/latest.txt')) {
+    throw 'GitHub 更新清单地址未通过安全校验。'
+}
+
+$handler = [System.Net.Http.HttpClientHandler]::new()
+$handler.UseCookies = $false
+$handler.AllowAutoRedirect = $true
+$handler.CheckCertificateRevocationList = $true
+$client = [System.Net.Http.HttpClient]::new($handler)
+$client.Timeout = [TimeSpan]::FromSeconds(15)
+$request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $manifestUri)
+$response = $null
+try {
+    [void]$request.Headers.UserAgent.ParseAdd('LanZ-Monitor/' + $CurrentVersion)
+    [void]$request.Headers.TryAddWithoutValidation('Accept', 'text/plain')
+    $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+    if (-not $response.IsSuccessStatusCode) {
+        throw ('GitHub latest.txt 返回 HTTP ' + [int]$response.StatusCode)
+    }
+    $contentLength = $response.Content.Headers.ContentLength
+    if ($null -ne $contentLength -and $contentLength -gt 4KB) {
+        throw 'GitHub 更新清单异常过大。'
+    }
+    $manifestText = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    if ($manifestText.Length -gt 4KB -or $manifestText.IndexOf([char]0) -ge 0) {
+        throw 'GitHub 更新清单内容无效。'
+    }
+
+    $manifest = @{}
+    $allowedKeys = @('version', 'file', 'size', 'sha256')
+    foreach ($line in @($manifestText -split '\r?\n')) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ($trimmed -notmatch '^([a-z0-9]+)=([^\r\n]+)$') {
+            throw 'GitHub 更新清单格式无效。'
+        }
+        $key = [string]$matches[1]
+        $value = [string]$matches[2]
+        if ($key -notin $allowedKeys -or $manifest.ContainsKey($key)) {
+            throw 'GitHub 更新清单包含未知或重复字段。'
+        }
+        $manifest[$key] = $value
+    }
+    if ($manifest.Count -ne $allowedKeys.Count) {
+        throw 'GitHub 更新清单缺少必要字段。'
+    }
+
+    $versionText = [string]$manifest.version
+    if ($versionText -notmatch '^\d+\.\d+\.\d+$') { throw '更新版本号格式无效。' }
+    $latestVersion = [Version]$versionText
+    $installedVersion = [Version]$CurrentVersion
+    $expectedAssetName = 'LanZ-Monitor-v' + $latestVersion.ToString(3) + '.exe'
+    if ([string]$manifest.file -cne $expectedAssetName) { throw '更新文件名与版本号不一致。' }
+    $assetSize = [long]0
+    if (-not [long]::TryParse([string]$manifest.size, [ref]$assetSize) -or $assetSize -lt 100KB -or $assetSize -gt 64MB) {
+        throw '更新文件大小无效。'
+    }
+    $hash = [string]$manifest.sha256
+    if ($hash -notmatch '^[0-9a-fA-F]{64}$') { throw '更新清单中的 SHA-256 无效。' }
+
+    $tag = 'v' + $latestVersion.ToString(3)
+    $htmlUri = [Uri]('https://github.com/' + $Repository + '/releases/tag/' + $tag)
+    $assetUri = [Uri]('https://github.com/' + $Repository + '/releases/download/' + $tag + '/' + $expectedAssetName)
+
+    [pscustomobject]@{
+        Operation = 'Check'
+        CurrentVersion = $installedVersion.ToString()
+        LatestVersion = $latestVersion.ToString()
+        UpdateAvailable = $latestVersion -gt $installedVersion
+        HtmlUrl = $htmlUri.AbsoluteUri
+        AssetUrl = $assetUri.AbsoluteUri
+        AssetName = $expectedAssetName
+        AssetSize = $assetSize
+        Digest = 'sha256:' + $hash.ToUpperInvariant()
+    }
+}
+finally {
+    if ($null -ne $response) { $response.Dispose() }
+    $request.Dispose()
+    $client.Dispose()
+    $handler.Dispose()
+}
+'@
+            [void]$worker.AddScript($checkScript)
+            [void]$worker.AddArgument([string]$script:UpdateManifestUrl)
+            [void]$worker.AddArgument([string]$script:UpdateRepository)
+            [void]$worker.AddArgument([string]$script:AppVersion)
+            $updateStatusText.Text = '正在安全检查 GitHub Release…'
+        }
+        else {
+            if ($null -eq $Release) {
+                throw '缺少待下载的 Release 信息。'
+            }
+            $updateDirectory = Join-Path $script:StateRoot ('updates\v' + [string]$Release.LatestVersion)
+            [void][IO.Directory]::CreateDirectory($updateDirectory)
+            $downloadScript = @'
+param($DownloadUrl, $AssetName, $ExpectedSize, $ExpectedDigest, $OutputDirectory, $CurrentVersion)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Net.Http
+
+$downloadUri = [Uri]$DownloadUrl
+if ($downloadUri.Scheme -ne 'https' -or $downloadUri.Host -ne 'github.com' -or
+    -not $downloadUri.AbsolutePath.StartsWith('/HankLiu2020/LanZ-Monitor/releases/download/', [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Release 下载地址未通过安全校验。'
+}
+if ($ExpectedDigest -notmatch '^sha256:([0-9a-fA-F]{64})$') {
+    throw 'Release 没有可用的 SHA-256 摘要，已拒绝自动下载。'
+}
+if ($AssetName -notmatch '^LanZ-Monitor-v\d+\.\d+\.\d+\.exe$') {
+    throw 'Release 附件名称未通过安全校验。'
+}
+$assetVersion = [Version]($AssetName -replace '^LanZ-Monitor-v(\d+\.\d+\.\d+)\.exe$', '$1')
+$downloadFileName = [Uri]::UnescapeDataString([IO.Path]::GetFileName($downloadUri.AbsolutePath))
+if ($downloadFileName -cne $AssetName) {
+    throw 'Release 下载地址与附件名称不一致。'
+}
+$expectedHash = $matches[1].ToUpperInvariant()
+$expectedLength = [long]$ExpectedSize
+if ($expectedLength -lt 100KB -or $expectedLength -gt 64MB) {
+    throw 'Release 文件大小超出允许范围。'
+}
+
+$temporaryPath = Join-Path $OutputDirectory ($AssetName + '.download')
+$readyPath = Join-Path $OutputDirectory ($AssetName + '.ready')
+if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force }
+if (Test-Path -LiteralPath $readyPath) { Remove-Item -LiteralPath $readyPath -Force }
+
+$handler = [System.Net.Http.HttpClientHandler]::new()
+$handler.UseCookies = $false
+$handler.AllowAutoRedirect = $true
+$handler.CheckCertificateRevocationList = $true
+$client = [System.Net.Http.HttpClient]::new($handler)
+$client.Timeout = [TimeSpan]::FromMinutes(2)
+$request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $downloadUri)
+$response = $null
+$inputStream = $null
+$outputStream = $null
+try {
+    [void]$request.Headers.UserAgent.ParseAdd('LanZ-Monitor/' + $CurrentVersion)
+    [void]$request.Headers.TryAddWithoutValidation('Accept', 'application/octet-stream')
+    $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+    if (-not $response.IsSuccessStatusCode) {
+        throw ('GitHub 下载返回 HTTP ' + [int]$response.StatusCode)
+    }
+    $declaredLength = $response.Content.Headers.ContentLength
+    if ($null -ne $declaredLength -and [long]$declaredLength -ne $expectedLength) {
+        throw 'Release 下载大小与元数据不一致。'
+    }
+    $inputStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+    $outputStream = [IO.File]::Create($temporaryPath)
+    $buffer = New-Object byte[] 81920
+    $total = [long]0
+    while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $total += $read
+        if ($total -gt $expectedLength -or $total -gt 64MB) {
+            throw 'Release 下载内容超出声明大小。'
+        }
+        $outputStream.Write($buffer, 0, $read)
+    }
+    $outputStream.Dispose()
+    $outputStream = $null
+    if ($total -ne $expectedLength) {
+        throw 'Release 下载不完整。'
+    }
+
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $fileStream = [IO.File]::OpenRead($temporaryPath)
+        try { $actualHash = ([BitConverter]::ToString($sha.ComputeHash($fileStream))).Replace('-', '') }
+        finally { $fileStream.Dispose() }
+    }
+    finally { $sha.Dispose() }
+    if ($actualHash -cne $expectedHash) {
+        throw 'Release SHA-256 校验失败，已拒绝安装。'
+    }
+    $downloadedVersion = [Version][Diagnostics.FileVersionInfo]::GetVersionInfo($temporaryPath).FileVersion
+    if ($downloadedVersion.Major -ne $assetVersion.Major -or
+        $downloadedVersion.Minor -ne $assetVersion.Minor -or
+        $downloadedVersion.Build -ne $assetVersion.Build) {
+        throw 'Release 文件版本与附件名称不一致。'
+    }
+    [IO.File]::Move($temporaryPath, $readyPath)
+    [pscustomobject]@{ Operation = 'Download'; ReadyPath = $readyPath; AssetName = $AssetName; Sha256 = $actualHash }
+}
+finally {
+    if ($null -ne $outputStream) { $outputStream.Dispose() }
+    if ($null -ne $inputStream) { $inputStream.Dispose() }
+    if ($null -ne $response) { $response.Dispose() }
+    $request.Dispose()
+    $client.Dispose()
+    $handler.Dispose()
+    if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+}
+'@
+            [void]$worker.AddScript($downloadScript)
+            [void]$worker.AddArgument([string]$Release.AssetUrl)
+            [void]$worker.AddArgument([string]$Release.AssetName)
+            [void]$worker.AddArgument([long]$Release.AssetSize)
+            [void]$worker.AddArgument([string]$Release.Digest)
+            [void]$worker.AddArgument([string]$updateDirectory)
+            [void]$worker.AddArgument([string]$script:AppVersion)
+            $updateStatusText.Text = '正在下载并校验更新…'
+        }
+
+        $script:UpdateWorker = [pscustomobject]@{
+            Operation = $Operation
+            PowerShell = $worker
+            Handle = $worker.BeginInvoke()
+        }
+        $script:UpdateInProgress = $true
+        $updateButton.IsEnabled = $false
+        $updatePollTimer.Start()
+    }
+    catch {
+        $worker.Dispose()
+        $script:UpdateInProgress = $false
+        $updateButton.IsEnabled = $true
+        throw
+    }
+}
+
+function Start-LanZVerifiedUpdateInstall {
+    param(
+        [Parameter(Mandatory)][string]$ReadyPath,
+        [Parameter(Mandatory)][ValidatePattern('^LanZ-Monitor-v\d+\.\d+\.\d+\.exe$')][string]$TargetFileName,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedSha256,
+        [Parameter(Mandatory)][string]$ReleaseUrl
+    )
+
+    $currentExecutable = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    if ([IO.Path]::GetFileName($currentExecutable) -notmatch '^(?:LanZ-Monitor(?:-v\d+\.\d+\.\d+)?|v\d+\.\d+\.\d+-LanZ-Monitor)\.exe$') {
+        $updateStatusText.Text = '源码运行模式不能自替换，请从 Release 页面更新。'
+        Open-LanZReleasePage -Url $ReleaseUrl
+        return
+    }
+    if (-not (Test-Path -LiteralPath $ReadyPath)) {
+        throw '已校验的更新文件不存在。'
+    }
+
+    $targetDirectory = Split-Path -Parent $currentExecutable
+    $targetExecutable = Join-Path $targetDirectory $TargetFileName
+    $writeTestPath = Join-Path $targetDirectory ('.lanz-update-write-test-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.File]::WriteAllText($writeTestPath, '')
+    }
+    catch {
+        $updateStatusText.Text = '程序目录不可写，请从 Release 页面手动更新。'
+        Open-LanZReleasePage -Url $ReleaseUrl
+        return
+    }
+    finally {
+        if (Test-Path -LiteralPath $writeTestPath) { Remove-Item -LiteralPath $writeTestPath -Force -ErrorAction SilentlyContinue }
+    }
+
+    $quoteLiteral = {
+        param([string]$Value)
+        "'" + $Value.Replace("'", "''") + "'"
+    }
+    $currentLiteral = & $quoteLiteral $currentExecutable
+    $targetLiteral = & $quoteLiteral $targetExecutable
+    $readyLiteral = & $quoteLiteral ([IO.Path]::GetFullPath($ReadyPath))
+    $logLiteral = & $quoteLiteral (Join-Path $script:DataDirectory 'update.log')
+    $hashLiteral = & $quoteLiteral $ExpectedSha256.ToUpperInvariant()
+    $updaterCode = @"
+`$ErrorActionPreference = 'Stop'
+`$waitProcessId = $PID
+`$currentPath = $currentLiteral
+`$targetPath = $targetLiteral
+`$readyPath = $readyLiteral
+`$logPath = $logLiteral
+`$expectedHash = $hashLiteral
+`$replacementPath = `$targetPath + '.update'
+`$backupPath = `$targetPath + '.previous'
+`$targetExisted = Test-Path -LiteralPath `$targetPath
+`$oldRestarted = `$false
+function Write-UpdateLog([string]`$message) {
+    try {
+        if ((Test-Path -LiteralPath `$logPath) -and (Get-Item -LiteralPath `$logPath).Length -gt 256KB) {
+            Remove-Item -LiteralPath (`$logPath + '.old') -Force -ErrorAction SilentlyContinue
+            Move-Item -LiteralPath `$logPath -Destination (`$logPath + '.old') -Force
+        }
+        Add-Content -LiteralPath `$logPath -Value ('[{0}] {1}' -f [DateTime]::Now.ToString('s'), `$message) -Encoding UTF8
+    } catch { }
+}
+try {
+    for (`$i = 0; `$i -lt 120; `$i++) {
+        if (`$null -eq (Get-Process -Id `$waitProcessId -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    if (`$null -ne (Get-Process -Id `$waitProcessId -ErrorAction SilentlyContinue)) { throw '旧版本未能及时退出。' }
+    `$sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        `$readyStream = [IO.File]::OpenRead(`$readyPath)
+        try { `$readyHash = ([BitConverter]::ToString(`$sha.ComputeHash(`$readyStream))).Replace('-', '') }
+        finally { `$readyStream.Dispose() }
+    }
+    finally { `$sha.Dispose() }
+    if (`$readyHash -cne `$expectedHash) { throw '安装前 SHA-256 复核失败。' }
+    Remove-Item -LiteralPath `$replacementPath -Force -ErrorAction SilentlyContinue
+    [IO.File]::Copy(`$readyPath, `$replacementPath, `$true)
+    Remove-Item -LiteralPath `$backupPath -Force -ErrorAction SilentlyContinue
+    if (`$targetExisted) {
+        try {
+            [IO.File]::Replace(`$replacementPath, `$targetPath, `$backupPath, `$true)
+        }
+        catch {
+            Move-Item -LiteralPath `$targetPath -Destination `$backupPath -Force
+            Move-Item -LiteralPath `$replacementPath -Destination `$targetPath -Force
+        }
+    }
+    else {
+        Move-Item -LiteralPath `$replacementPath -Destination `$targetPath -Force
+    }
+    try {
+        `$newProcess = Start-Process -FilePath `$targetPath -PassThru
+        Start-Sleep -Seconds 3
+        if (`$newProcess.HasExited) {
+            throw ('新版本启动后意外退出，exitCode=' + `$newProcess.ExitCode)
+        }
+        `$newProcess.Dispose()
+        Write-UpdateLog 'update installed and restarted'
+        Remove-Item -LiteralPath `$readyPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath `$backupPath -Force -ErrorAction SilentlyContinue
+        if (`$currentPath -ne `$targetPath) {
+            Remove-Item -LiteralPath `$currentPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        if (Test-Path -LiteralPath `$backupPath) {
+            [IO.File]::Copy(`$backupPath, `$targetPath, `$true)
+        }
+        elseif (-not `$targetExisted) {
+            Remove-Item -LiteralPath `$targetPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath `$currentPath) {
+            Start-Process -FilePath `$currentPath
+            `$oldRestarted = `$true
+        }
+        throw
+    }
+}
+catch {
+    Write-UpdateLog ('update failed: ' + `$_.Exception.Message)
+    Remove-Item -LiteralPath `$replacementPath -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath `$targetPath) -and (Test-Path -LiteralPath `$backupPath)) {
+        Move-Item -LiteralPath `$backupPath -Destination `$targetPath -Force -ErrorAction SilentlyContinue
+    }
+    if (-not `$oldRestarted -and (Test-Path -LiteralPath `$currentPath)) {
+        Start-Process -FilePath `$currentPath -ErrorAction SilentlyContinue
+    }
+}
+"@
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($updaterCode))
+    $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $powerShellPath
+    $startInfo.Arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand ' + $encodedCommand
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $process = [Diagnostics.Process]::Start($startInfo)
+    if ($null -eq $process) {
+        throw '无法启动本地更新替换程序。'
+    }
+    $process.Dispose()
+    $script:ExitRequested = $true
+    $window.Close()
+}
+
+function Complete-LanZUpdateOperation {
+    if ($null -eq $script:UpdateWorker -or -not $script:UpdateWorker.Handle.IsCompleted) {
+        return
+    }
+
+    $updatePollTimer.Stop()
+    $worker = $script:UpdateWorker
+    $script:UpdateWorker = $null
+    $script:UpdateInProgress = $false
+    $updateButton.IsEnabled = $true
+    try {
+        $result = @($worker.PowerShell.EndInvoke($worker.Handle) | Select-Object -Last 1)[0]
+        if ($null -eq $result) { throw '更新操作没有返回结果。' }
+        if ([string]$result.Operation -eq 'Check') {
+            $script:PendingUpdate = $result
+            if (-not [bool]$result.UpdateAvailable) {
+                $updateStatusText.Text = '已是最新版本 v' + [string]$script:AppVersion
+                return
+            }
+            if ([string]::IsNullOrWhiteSpace([string]$result.AssetUrl)) {
+                $updateStatusText.Text = '新版本未附带正确命名的 EXE。'
+                [void][Windows.MessageBox]::Show('发现新版本，但没有可用的 EXE 附件。请查看官方 Release 页面。', 'LanZ Monitor 更新', [Windows.MessageBoxButton]::OK, [Windows.MessageBoxImage]::Warning)
+                Open-LanZReleasePage -Url ([string]$result.HtmlUrl)
+                return
+            }
+            if ([string]$result.Digest -notmatch '^sha256:[0-9a-fA-F]{64}$') {
+                $updateStatusText.Text = '新版本缺少 SHA-256，已禁止自动安装。'
+                $choice = [Windows.MessageBox]::Show('发现新版本 v' + [string]$result.LatestVersion + '，但 GitHub 没有提供可校验的 SHA-256。为安全起见不会自动下载。是否打开官方 Release 页面？', 'LanZ Monitor 更新', [Windows.MessageBoxButton]::YesNo, [Windows.MessageBoxImage]::Warning)
+                if ($choice -eq [Windows.MessageBoxResult]::Yes) { Open-LanZReleasePage -Url ([string]$result.HtmlUrl) }
+                return
+            }
+            $updateStatusText.Text = '发现新版本 v' + [string]$result.LatestVersion
+            Start-LanZUpdateOperation -Operation Download -Release $result
+        }
+        elseif ([string]$result.Operation -eq 'Download') {
+            $updateStatusText.Text = '更新已下载并通过 SHA-256 校验。'
+            $choice = [Windows.MessageBox]::Show('更新已下载并通过 SHA-256 校验。是否现在退出程序、完成替换并重新启动？', 'LanZ Monitor 更新', [Windows.MessageBoxButton]::YesNo, [Windows.MessageBoxImage]::Information)
+            if ($choice -eq [Windows.MessageBoxResult]::Yes) {
+                Start-LanZVerifiedUpdateInstall -ReadyPath ([string]$result.ReadyPath) -TargetFileName ([string]$result.AssetName) -ExpectedSha256 ([string]$result.Sha256) -ReleaseUrl ([string]$script:PendingUpdate.HtmlUrl)
+            }
+        }
+    }
+    catch {
+        $errorMessage = $_.Exception.GetBaseException().Message
+        $updateStatusText.Text = '更新失败：' + $errorMessage
+        [void][Windows.MessageBox]::Show($updateStatusText.Text, 'LanZ Monitor 更新', [Windows.MessageBoxButton]::OK, [Windows.MessageBoxImage]::Warning)
+    }
+    finally {
+        $worker.PowerShell.Dispose()
+    }
+}
+
 $timer = [Windows.Threading.DispatcherTimer]::new()
 Set-LanZJitteredInterval
 $timer.Add_Tick({
@@ -3235,6 +3552,9 @@ $timer.Add_Tick({
 $refreshPollTimer = [Windows.Threading.DispatcherTimer]::new()
 $refreshPollTimer.Interval = [TimeSpan]::FromMilliseconds(120)
 $refreshPollTimer.Add_Tick({ Complete-LanZRefresh })
+$updatePollTimer = [Windows.Threading.DispatcherTimer]::new()
+$updatePollTimer.Interval = [TimeSpan]::FromMilliseconds(150)
+$updatePollTimer.Add_Tick({ Complete-LanZUpdateOperation })
 $script:BrowserCaptureTimer = [Windows.Threading.DispatcherTimer]::new()
 $script:BrowserCaptureTimer.Interval = [TimeSpan]::FromMilliseconds(120)
 $script:BrowserCaptureTimer.Add_Tick({ Step-LanZBrowserCapture })
@@ -3270,6 +3590,14 @@ $loginButton.Add_Click({
     $settingsPopup.IsOpen = $false
     $script:SuppressAutoLogin = $false
     [void]$window.Dispatcher.BeginInvoke([Action]{ Show-LanZLogin -ClearExistingSession })
+})
+$updateButton.Add_Click({
+    try {
+        Start-LanZUpdateOperation -Operation Check
+    }
+    catch {
+        $updateStatusText.Text = '更新失败：' + $_.Exception.GetBaseException().Message
+    }
 })
 $settingsButton.Add_Checked({ $settingsPopup.IsOpen = $true })
 $settingsButton.Add_Unchecked({ $settingsPopup.IsOpen = $false })
@@ -3441,6 +3769,11 @@ $window.Add_Loaded({
     }
     try {
         Initialize-LanZTrayIcon
+        $needsInitialLogin = -not (Test-Path -LiteralPath $script:SessionPath)
+        if ($needsInitialLogin) {
+            [void]$window.Dispatcher.BeginInvoke([Action]{ Show-LanZLogin -ClearExistingSession })
+            return
+        }
         Start-LanZBrowserCapture
     }
     catch {
@@ -3453,6 +3786,7 @@ $window.Add_Closed({
     $startupTimer.Stop()
     $timer.Stop()
     $refreshPollTimer.Stop()
+    $updatePollTimer.Stop()
     Stop-LanZBrowserCapture
     Dispose-LanZTrayIcon
     if ($null -ne $script:RefreshWorker) {
@@ -3465,6 +3799,12 @@ $window.Add_Closed({
         $script:RefreshWorker.PowerShell.Dispose()
         $script:RefreshWorker = $null
         $script:RefreshInProgress = $false
+    }
+    if ($null -ne $script:UpdateWorker) {
+        try { $script:UpdateWorker.PowerShell.Stop() } catch { }
+        $script:UpdateWorker.PowerShell.Dispose()
+        $script:UpdateWorker = $null
+        $script:UpdateInProgress = $false
     }
 })
 
