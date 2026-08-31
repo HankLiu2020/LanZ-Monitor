@@ -8,7 +8,7 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.4.1'
+$script:AppVersion = '1.4.2'
 $script:UpdateRepository = 'HankLiu2020/LanZ-Monitor'
 $script:UpdateManifestUrl = "https://github.com/$($script:UpdateRepository)/releases/latest/download/latest.txt"
 $script:UpdateReleaseUrl = "https://github.com/$($script:UpdateRepository)/releases/latest"
@@ -76,6 +76,7 @@ $script:DragStartPoint = $null
 $script:DragModelId = $null
 $script:RefreshInProgress = $false
 $script:RefreshWorker = $null
+$script:ForceBillingRefreshPending = $false
 $script:LastSuccessfulModelRefreshUtc = [DateTime]::MinValue
 $script:BrowserReloadSeconds = 15
 $script:BrowserCaptureWindow = $null
@@ -428,7 +429,8 @@ function Import-LanZBillingRulesCache {
 function Get-LanZBillingRules {
     param(
         [Parameter(Mandatory)][string]$SessionValue,
-        [System.Net.Http.HttpClient]$HttpClient
+        [System.Net.Http.HttpClient]$HttpClient,
+        [switch]$Force
     )
 
     # 手动覆盖文件优先级最高:用户可手写规则,在前端改版导致自动抓取失效时兜底。
@@ -448,7 +450,7 @@ function Get-LanZBillingRules {
     }
 
     $cached = Import-LanZBillingRulesCache
-    if ($null -ne $cached) {
+    if ($null -ne $cached -and -not $Force) {
         try {
             $fetchedAt = [DateTime]::Parse(
                 [string]$cached.FetchedAt,
@@ -1642,7 +1644,7 @@ function Export-LanZWindowScreenshot {
                         <Separator Margin="0,7,0,7" Background="#E7ECEF"/>
                         <Button x:Name="LoginButton" Content="重新登录 / 切换凭据" Height="29" FontSize="11" Foreground="#5A47E5" Background="#F0EEFF" BorderBrush="#D9D3FF" Cursor="Hand"/>
                         <Button x:Name="UpdateButton" Content="检查更新" Height="29" Margin="0,7,0,0" FontSize="11" Foreground="#356A5A" Background="#EAF7F2" BorderBrush="#BCE4D4" Cursor="Hand"/>
-                        <TextBlock x:Name="UpdateStatusText" Text="当前版本 v1.4.1" Margin="2,6,2,0" FontSize="9" Foreground="#87949E" TextWrapping="Wrap"/>
+                        <TextBlock x:Name="UpdateStatusText" Text="当前版本 v1.4.2" Margin="2,6,2,0" FontSize="9" Foreground="#87949E" TextWrapping="Wrap"/>
                     </StackPanel>
                 </Border>
             </Popup>
@@ -1997,7 +1999,14 @@ function Step-LanZBrowserCapture {
 
         if ($state.Stage -eq 'bootstrap') {
             Complete-LanZBrowserResponses
-            $bootstrapReady = $null -ne $script:BrowserModels -and $null -ne $script:BrowserUsage
+            $bootstrapReady = if ($state.ManualRefreshActive) {
+                # 手动刷新必须等到资源看板返回一个比点击前更新的用量包，
+                # 不能因为内存里已有旧请求数就立刻跳回模型页面。
+                $script:BrowserLastUsageUtc -gt $state.UsageRefreshBaselineUtc
+            }
+            else {
+                $null -ne $script:BrowserModels -and $null -ne $script:BrowserUsage
+            }
             if ($bootstrapReady -or [DateTime]::UtcNow -ge $state.BootstrapDeadlineUtc) {
                 $script:BrowserView.CoreWebView2.Navigate($state.MonitorUri)
                 $state.LastNavigationUtc = [DateTime]::UtcNow
@@ -2009,6 +2018,30 @@ function Step-LanZBrowserCapture {
 
         if ($state.Stage -eq 'monitor') {
             Complete-LanZBrowserResponses
+            if ($state.ManualRefreshActive) {
+                $usageRefreshed = $script:BrowserLastUsageUtc -gt $state.UsageRefreshBaselineUtc
+                $modelsRefreshed = $script:BrowserLastModelsUtc -gt $state.ModelRefreshBaselineUtc
+                if ($usageRefreshed -and $modelsRefreshed) {
+                    $state.ManualRefreshActive = $false
+                    $updatedText.Text = '已完整刷新 ' + (Get-Date).ToString('HH:mm:ss')
+                    $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
+                    Write-LanZBrowserDiag 'manual full refresh completed'
+                    if ($state.ManualOnly -and -not $autoRefreshToggle.IsChecked) {
+                        Stop-LanZBrowserCapture
+                        return
+                    }
+                }
+                elseif ([DateTime]::UtcNow -ge $state.ManualRefreshDeadlineUtc) {
+                    $state.ManualRefreshActive = $false
+                    $updatedText.Text = '完整刷新超时，已保留上次数据'
+                    $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#E6A23C')
+                    Write-LanZBrowserDiag ('manual full refresh timeout usage={0} models={1}' -f $usageRefreshed, $modelsRefreshed)
+                    if ($state.ManualOnly -and -not $autoRefreshToggle.IsChecked) {
+                        Stop-LanZBrowserCapture
+                        return
+                    }
+                }
+            }
             if ($state.SignedOut -or -not $state.AtMonitorPage) {
                 return
             }
@@ -2142,12 +2175,15 @@ function Stop-LanZBrowserCapture {
 }
 
 function Start-LanZBrowserCapture {
-    param([switch]$Restart)
+    param(
+        [switch]$Restart,
+        [switch]$Manual
+    )
 
     if ($Restart) {
         Stop-LanZBrowserCapture
     }
-    if ($null -ne $script:BrowserCaptureState -or -not $autoRefreshToggle.IsChecked) {
+    if ($null -ne $script:BrowserCaptureState -or (-not $autoRefreshToggle.IsChecked -and -not $Manual)) {
         return
     }
 
@@ -2201,6 +2237,11 @@ function Start-LanZBrowserCapture {
             BootstrapDeadlineUtc = [DateTime]::UtcNow.AddSeconds(10)
             LastNavigationUtc = [DateTime]::UtcNow
             FirstCaptureLogged = $false
+            ManualRefreshActive = [bool]$Manual
+            ManualOnly = [bool]$Manual -and -not [bool]$autoRefreshToggle.IsChecked
+            UsageRefreshBaselineUtc = [DateTime]::MinValue
+            ModelRefreshBaselineUtc = [DateTime]::MinValue
+            ManualRefreshDeadlineUtc = if ($Manual) { [DateTime]::UtcNow.AddSeconds(25) } else { [DateTime]::MinValue }
         }
         $script:BrowserLastModelsUtc = [DateTime]::MinValue
         $script:BrowserLastUsageUtc = [DateTime]::MinValue
@@ -2215,6 +2256,35 @@ function Start-LanZBrowserCapture {
         $updatedText.Text = '浏览器同步不可用，请重新验证'
         $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#E6A23C')
     }
+}
+
+function Request-LanZBrowserFullRefresh {
+    # 手动刷新先回到资源看板，等待一次新的用量响应，再回主页面
+    # 打开模型监控弹窗。这样一次点击同时更新请求数、额度和模型负载。
+    if ($null -eq $script:BrowserCaptureState -or $null -eq $script:BrowserView -or $null -eq $script:BrowserView.CoreWebView2) {
+        Write-LanZBrowserDiag 'manual full refresh requested with new capture'
+        Start-LanZBrowserCapture -Restart -Manual
+        return
+    }
+
+    $state = $script:BrowserCaptureState
+    $state.ManualRefreshActive = $true
+    $state.ManualOnly = $false
+    $state.UsageRefreshBaselineUtc = $script:BrowserLastUsageUtc
+    $state.ModelRefreshBaselineUtc = $script:BrowserLastModelsUtc
+    $state.ManualRefreshDeadlineUtc = [DateTime]::UtcNow.AddSeconds(25)
+    $state.Stage = 'bootstrap'
+    $state.SignedOut = $false
+    $state.AtMonitorPage = $false
+    $state.MonitorPanelReady = $false
+    $state.PanelScriptTask = $null
+    $state.ModelMetadataTask = $null
+    $state.BootstrapDeadlineUtc = [DateTime]::UtcNow.AddSeconds(10)
+    $state.LastNavigationUtc = [DateTime]::UtcNow
+    $script:BrowserView.CoreWebView2.Navigate($state.NavigationUri)
+    $updatedText.Text = '正在完整刷新…'
+    $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
+    Write-LanZBrowserDiag 'manual full refresh requested'
 }
 
 function Write-LanZBrowserDiag {
@@ -2807,8 +2877,17 @@ function Set-LanZRefreshError {
 }
 
 function Start-LanZRefresh {
+    param([switch]$ForceBilling)
+
     if ($script:RefreshInProgress) {
+        if ($ForceBilling) {
+            $script:ForceBillingRefreshPending = $true
+        }
         return
+    }
+
+    if ($ForceBilling) {
+        $script:ForceBillingRefreshPending = $false
     }
 
     try {
@@ -2833,7 +2912,8 @@ param(
     [string]$BillingRulesPath,
     [string]$BillingOverridesPath,
     [string]$LastBillingFetchUtc,
-    [int]$BillingRefreshSeconds
+    [int]$BillingRefreshSeconds,
+    [bool]$ForceBilling
 )
 
 Set-StrictMode -Version Latest
@@ -2850,7 +2930,7 @@ $global:BillingRules = $null
 $global:BillingRefreshSeconds = $BillingRefreshSeconds
 # 计费规则首次无缓存时同步一次，之后最多四小时读取一次看板规则。
 $global:ShouldFetchBilling = $true
-if (-not [string]::IsNullOrWhiteSpace($LastBillingFetchUtc)) {
+if (-not $ForceBilling -and -not [string]::IsNullOrWhiteSpace($LastBillingFetchUtc)) {
     try {
         $lastBilling = [DateTime]::Parse($LastBillingFetchUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
         if (([DateTime]::UtcNow - $lastBilling).TotalSeconds -lt $BillingRefreshSeconds) {
@@ -2863,7 +2943,7 @@ if (-not [string]::IsNullOrWhiteSpace($LastBillingFetchUtc)) {
 $billingRules = $null
 $billingRefreshed = $false
 if ($global:ShouldFetchBilling) {
-    $billingRules = Get-LanZBillingRules -SessionValue $SessionValue -HttpClient $HttpClient
+    $billingRules = Get-LanZBillingRules -SessionValue $SessionValue -HttpClient $HttpClient -Force:$ForceBilling
     $billingRefreshed = $true
 }
 [pscustomobject]@{
@@ -2891,6 +2971,7 @@ if ($global:ShouldFetchBilling) {
         $lastBillingArg = if ($script:LastBillingFetchUtc -ne [DateTime]::MinValue) { $script:LastBillingFetchUtc.ToString('o') } else { '' }
         [void]$worker.AddArgument($lastBillingArg)
         [void]$worker.AddArgument([int]$script:BillingRefreshSeconds)
+        [void]$worker.AddArgument([bool]$ForceBilling)
         $script:RefreshWorker = [pscustomobject]@{
             PowerShell = $worker
             Handle = $worker.BeginInvoke()
@@ -2951,7 +3032,13 @@ function Complete-LanZRefresh {
             $script:BrowserUsage = $usageOverview
         }
         Update-LanZLocalQuotaStatus
-        $snapshotModels = if ($hasModelData) { $models } else { @($script:BrowserModels) }
+        $snapshotModels = @()
+        if ($hasModelData) {
+            $snapshotModels = @($models)
+        }
+        elseif ($null -ne $script:BrowserModels) {
+            $snapshotModels = @($script:BrowserModels)
+        }
         if ($snapshotModels.Count -gt 0 -and $null -ne $usageOverview) {
             try {
                 Save-LanZStatusSnapshot -Models $snapshotModels -Overview $usageOverview
@@ -2962,6 +3049,9 @@ function Complete-LanZRefresh {
         }
         # 记录低频调用节奏:只有真正发起了请求才更新对应时间戳。
         Save-LanZRefreshCadence -UsageUpdated:([bool]$result.UsageRefreshed) -BillingUpdated:([bool]$result.BillingRefreshed)
+        if ([bool]$result.BillingRefreshed) {
+            Write-LanZBrowserDiag 'billing rules refresh completed'
+        }
         if ($hasModelData) {
             $script:LastSuccessfulModelRefreshUtc = [DateTime]::UtcNow
             $updatedText.Text = '已更新 ' + (Get-Date).ToString('HH:mm:ss')
@@ -2969,10 +3059,20 @@ function Complete-LanZRefresh {
         }
     }
     catch {
+        $refreshFailure = $_.Exception.GetBaseException().Message
+        if (-not [string]::IsNullOrWhiteSpace([string]$_.ScriptStackTrace)) {
+            $refreshFailure += ' stack=' + ([string]$_.ScriptStackTrace -replace '[\r\n]+', ' ')
+        }
+        Write-LanZBrowserDiag ('billing rules refresh failed: {0}' -f $refreshFailure)
         Set-LanZRefreshError -Exception $_.Exception
     }
     finally {
         $worker.PowerShell.Dispose()
+    }
+
+    if ($script:ForceBillingRefreshPending) {
+        $script:ForceBillingRefreshPending = $false
+        Start-LanZRefresh -ForceBilling
     }
 }
 
@@ -2983,17 +3083,11 @@ function Update-Widget {
     Update-LanZLocalQuotaStatus
 
     if ($Force) {
-        # 手动刷新也只操作真实 WebView2 页面，不调用模型接口。
-        if ($null -ne $script:BrowserView -and $null -ne $script:BrowserView.CoreWebView2) {
-            if ($null -ne $script:BrowserCaptureState) {
-                $script:BrowserCaptureState.MonitorPanelReady = $false
-                $script:BrowserCaptureState.LastNavigationUtc = [DateTime]::UtcNow
-            }
-            $script:BrowserView.CoreWebView2.Reload()
-        }
-        else {
-            Start-LanZBrowserCapture -Restart
-        }
+        # 手动刷新是完整刷新：先让真实资源看板产生新的当日用量包，
+        # 再回模型页面取得新负载，并强制同步一次计费规则。
+        Request-LanZBrowserFullRefresh
+        Start-LanZRefresh -ForceBilling
+        return
     }
 
     # 当日额度只来自真实 WebView2 页面响应。计费规则按 4 小时低频读取
@@ -3743,15 +3837,20 @@ $window.Add_Loaded({
     Update-LanZQuotaVisibility
     Show-LanZCachedStatus
     if (-not [string]::IsNullOrWhiteSpace($ScreenshotPath) -or -not [string]::IsNullOrWhiteSpace($SettingsScreenshotPath)) {
-        Update-Widget
+        Update-Widget -Force
         if (-not [string]::IsNullOrWhiteSpace($SettingsScreenshotPath)) {
             $settingsButton.IsChecked = $true
         }
-        $screenshotDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        $screenshotNotBefore = [DateTime]::UtcNow.AddSeconds(25)
+        $screenshotDeadline = [DateTime]::UtcNow.AddSeconds(40)
         $screenshotTimer = [Windows.Threading.DispatcherTimer]::new()
         $screenshotTimer.Interval = [TimeSpan]::FromMilliseconds(500)
         $screenshotTimer.Add_Tick({
-            if ($script:RefreshInProgress -and [DateTime]::UtcNow -lt $screenshotDeadline) {
+            if ([DateTime]::UtcNow -lt $screenshotNotBefore) {
+                return
+            }
+            $browserManualRefreshActive = $null -ne $script:BrowserCaptureState -and [bool]$script:BrowserCaptureState.ManualRefreshActive
+            if (($script:RefreshInProgress -or $browserManualRefreshActive) -and [DateTime]::UtcNow -lt $screenshotDeadline) {
                 return
             }
             $screenshotTimer.Stop()
