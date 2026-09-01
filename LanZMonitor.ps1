@@ -8,7 +8,7 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.4.2'
+$script:AppVersion = '1.4.3'
 $script:UpdateRepository = 'HankLiu2020/LanZ-Monitor'
 $script:UpdateManifestUrl = "https://github.com/$($script:UpdateRepository)/releases/latest/download/latest.txt"
 $script:UpdateReleaseUrl = "https://github.com/$($script:UpdateRepository)/releases/latest"
@@ -55,6 +55,7 @@ $script:LastBillingFetchUtc = [DateTime]::MinValue
 $script:CachedStatusSnapshot = $null
 $script:StatusLogWriteCount = 0
 $script:LastArchivedStatusTime = [DateTime]::MinValue
+$script:LastHistoryPersistUtc = [DateTime]::MinValue
 $script:StatusRetentionDays = 30
 $script:UiPreferences = [ordered]@{ AutoRefresh = $true; ShowExternalQuota = $false; ShowInternalQuota = $true; ChartMode = 'bar' }
 $script:ChartWidth = 330.0
@@ -79,6 +80,7 @@ $script:RefreshWorker = $null
 $script:ForceBillingRefreshPending = $false
 $script:LastSuccessfulModelRefreshUtc = [DateTime]::MinValue
 $script:BrowserReloadSeconds = 15
+$script:BrowserUiRefreshSeconds = 10
 $script:BrowserCaptureWindow = $null
 $script:BrowserView = $null
 $script:BrowserCaptureState = $null
@@ -89,6 +91,10 @@ $script:BrowserActualModelMap = @{}
 $script:BrowserUsage = $null
 $script:BrowserLastModelsUtc = [DateTime]::MinValue
 $script:BrowserLastUsageUtc = [DateTime]::MinValue
+$script:BrowserLastUiUpdateUtc = [DateTime]::MinValue
+$script:BrowserLastDataPersistUtc = [DateTime]::MinValue
+$script:BrowserUiRefreshPending = $false
+$script:ResumeUiTimer = $null
 $script:ExitRequested = $false
 $script:TrayIcon = $null
 $script:TrayContextMenu = $null
@@ -98,6 +104,10 @@ $script:TrayOwnedIcon = $null
 $script:TrayPinHandler = $null
 $script:TrayExitHandler = $null
 $script:TrayDoubleClickHandler = $null
+$script:TrayWindowState = @{
+    Hidden = $false
+    LastDoubleClickUtc = [DateTime]::MinValue
+}
 $script:SharedHttpHandler = $null
 $script:SharedHttpClient = $null
 $script:UpdateWorker = $null
@@ -965,24 +975,80 @@ function Save-LanZHistory {
     $now = [DateTime]::UtcNow
     foreach ($key in @($script:LoadHistory.Keys)) {
         $storedSamples = @(Get-LanZChartDisplaySamples -Samples @($script:LoadHistory[$key]) -Now $now)
-        $payload[$key] = @($storedSamples | ForEach-Object {
-            [ordered]@{
-                Timestamp = $_.Timestamp.ToUniversalTime().ToString('o')
-                EndTimestamp = if ($null -ne $_.PSObject.Properties['EndTimestamp'] -and $_.EndTimestamp -is [DateTime]) {
-                    $_.EndTimestamp.ToUniversalTime().ToString('o')
-                }
-                else {
-                    $_.Timestamp.ToUniversalTime().ToString('o')
-                }
-                Percent = [int]$_.Percent
+        $compactedHistory = [System.Collections.Generic.List[object]]::new()
+        $serializedSamples = [System.Collections.Generic.List[object]]::new()
+        foreach ($sample in $storedSamples) {
+            $sampleTimestamp = $sample.Timestamp.ToUniversalTime()
+            $sampleEndTimestamp = if ($null -ne $sample.PSObject.Properties['EndTimestamp'] -and $sample.EndTimestamp -is [DateTime]) {
+                $sample.EndTimestamp.ToUniversalTime()
             }
-        })
+            else {
+                $sampleTimestamp
+            }
+            # 文件中保存的是降采样结果，内存也必须同步替换为同一份有界
+            # 数据；否则长时间运行会继续积累每 3 秒一个的原始点，导致
+            # 每次绘图遍历越来越慢，而重启后又因读取压缩文件暂时恢复。
+            $compactedHistory.Add([pscustomobject]@{
+                Timestamp = $sampleTimestamp
+                EndTimestamp = $sampleEndTimestamp
+                Percent = [int]$sample.Percent
+            })
+            $serializedSamples.Add([ordered]@{
+                Timestamp = $sampleTimestamp.ToString('o')
+                EndTimestamp = $sampleEndTimestamp.ToString('o')
+                Percent = [int]$sample.Percent
+            })
+        }
+        $script:LoadHistory[$key] = $compactedHistory
+        $payload[$key] = @($serializedSamples)
     }
     [System.IO.File]::WriteAllText(
         $script:HistoryPath,
         ($payload | ConvertTo-Json -Depth 5 -Compress),
         [System.Text.UTF8Encoding]::new($false)
     )
+}
+
+function Add-LanZHistorySamples {
+    param(
+        [Parameter(Mandatory)][array]$Models,
+        [DateTime]$SampleTimestamp = [DateTime]::UtcNow,
+        [DateTime]$Now = [DateTime]::UtcNow,
+        [switch]$SkipSample
+    )
+
+    $sampleTime = $SampleTimestamp.ToUniversalTime()
+    $cutoff = $Now.ToUniversalTime().AddHours(-5)
+    if ($sampleTime -lt $cutoff) {
+        $sampleTime = $cutoff
+    }
+    foreach ($model in $Models) {
+        $key = [string]$model.ModelId
+        if (-not $script:LoadHistory.ContainsKey($key)) {
+            $script:LoadHistory[$key] = [System.Collections.Generic.List[object]]::new()
+        }
+        $history = $script:LoadHistory[$key]
+        $lastSample = if ($history.Count -gt 0) { $history[$history.Count - 1] } else { $null }
+        if (-not $SkipSample -and ($null -eq $lastSample -or [math]::Abs(($lastSample.Timestamp - $sampleTime).TotalSeconds) -gt 2)) {
+            $history.Add([pscustomobject]@{
+                Timestamp = $sampleTime
+                EndTimestamp = $sampleTime
+                Percent = [int]$model.Percent
+            })
+        }
+        while ($history.Count -gt 0) {
+            $oldestEndTimestamp = if ($null -ne $history[0].PSObject.Properties['EndTimestamp']) {
+                $history[0].EndTimestamp
+            }
+            else {
+                $history[0].Timestamp
+            }
+            if ($oldestEndTimestamp -ge $cutoff) {
+                break
+            }
+            $history.RemoveAt(0)
+        }
+    }
 }
 
 function Get-LanZTimelineX {
@@ -1103,33 +1169,10 @@ function Add-LanZChartHistory {
     if ($sampleTime -lt $cutoff) {
         $sampleTime = $cutoff
     }
+    Add-LanZHistorySamples -Models $Models -SampleTimestamp $sampleTime -Now $now -SkipSample:$SkipSample
     foreach ($model in $Models) {
         $key = [string]$model.ModelId
-        if (-not $script:LoadHistory.ContainsKey($key)) {
-            $script:LoadHistory[$key] = [System.Collections.Generic.List[object]]::new()
-        }
-
         $history = $script:LoadHistory[$key]
-        $lastSample = if ($history.Count -gt 0) { $history[$history.Count - 1] } else { $null }
-        if (-not $SkipSample -and ($null -eq $lastSample -or [math]::Abs(($lastSample.Timestamp - $sampleTime).TotalSeconds) -gt 2)) {
-            $history.Add([pscustomobject]@{
-                Timestamp = $sampleTime
-                EndTimestamp = $sampleTime
-                Percent = [int]$model.Percent
-            })
-        }
-        while ($history.Count -gt 0) {
-            $oldestEndTimestamp = if ($null -ne $history[0].PSObject.Properties['EndTimestamp']) {
-                $history[0].EndTimestamp
-            }
-            else {
-                $history[0].Timestamp
-            }
-            if ($oldestEndTimestamp -ge $cutoff) {
-                break
-            }
-            $history.RemoveAt(0)
-        }
 
         $samples = @(Get-LanZChartDisplaySamples -Samples @($history) -Now $now)
         $values = @($samples | ForEach-Object { [int]$_.Percent })
@@ -1278,9 +1321,11 @@ function Add-LanZChartHistory {
         )) -Force
     }
 
-    if (-not $SkipPersistence) {
+    if (-not $SkipPersistence -and
+        ([DateTime]::UtcNow - $script:LastHistoryPersistUtc).TotalSeconds -ge 10) {
         try {
             Save-LanZHistory
+            $script:LastHistoryPersistUtc = [DateTime]::UtcNow
         }
         catch {
             # History persistence is optional; a write failure must not stop live monitoring.
@@ -1290,6 +1335,16 @@ function Add-LanZChartHistory {
 }
 
 Initialize-LanZHistory
+if ($script:LoadHistory.Count -gt 0) {
+    try {
+        # 启动时立即迁移旧版本遗留的密集采样，而不是等待下一次状态包。
+        Save-LanZHistory
+        $script:LastHistoryPersistUtc = [DateTime]::UtcNow
+    }
+    catch {
+        # 历史迁移失败不阻断主程序；后续正常采样仍会再次尝试压缩。
+    }
+}
 Initialize-LanZStatusSnapshot
 Import-LanZRefreshCadence
 [void](Import-LanZBillingRulesCache)
@@ -1644,7 +1699,7 @@ function Export-LanZWindowScreenshot {
                         <Separator Margin="0,7,0,7" Background="#E7ECEF"/>
                         <Button x:Name="LoginButton" Content="重新登录 / 切换凭据" Height="29" FontSize="11" Foreground="#5A47E5" Background="#F0EEFF" BorderBrush="#D9D3FF" Cursor="Hand"/>
                         <Button x:Name="UpdateButton" Content="检查更新" Height="29" Margin="0,7,0,0" FontSize="11" Foreground="#356A5A" Background="#EAF7F2" BorderBrush="#BCE4D4" Cursor="Hand"/>
-                        <TextBlock x:Name="UpdateStatusText" Text="当前版本 v1.4.2" Margin="2,6,2,0" FontSize="9" Foreground="#87949E" TextWrapping="Wrap"/>
+                        <TextBlock x:Name="UpdateStatusText" Text="当前版本 v1.4.3" Margin="2,6,2,0" FontSize="9" Foreground="#87949E" TextWrapping="Wrap"/>
                     </StackPanel>
                 </Border>
             </Popup>
@@ -1759,6 +1814,8 @@ function Import-LanZWebView2Runtime {
 }
 
 function Update-LanZFromBrowserCapture {
+    param([switch]$DataOnly)
+
     if ($null -eq $script:BrowserModels) {
         return
     }
@@ -1772,6 +1829,23 @@ function Update-LanZFromBrowserCapture {
     }
 
     $models = @($script:BrowserModels)
+    if ($DataOnly) {
+        Add-LanZHistorySamples -Models $models
+        if (([DateTime]::UtcNow - $script:LastHistoryPersistUtc).TotalSeconds -ge 10) {
+            try {
+                Save-LanZHistory
+                $script:LastHistoryPersistUtc = [DateTime]::UtcNow
+            }
+            catch { }
+        }
+        try {
+            Save-LanZStatusSnapshot -Models $models -Overview $overview
+        }
+        catch { }
+        $script:BrowserLastDataPersistUtc = [DateTime]::UtcNow
+        return
+    }
+
     $modelsWithHistory = @(Add-LanZChartHistory -Models $models)
     $script:DisplayedModels = @(Sort-LanZModels -Models $modelsWithHistory)
     $modelsList.ItemsSource = $script:DisplayedModels
@@ -1783,6 +1857,8 @@ function Update-LanZFromBrowserCapture {
         # 浏览器数据仍可实时显示；本地快照失败不阻断同步。
     }
     $script:LastSuccessfulModelRefreshUtc = [DateTime]::UtcNow
+    $script:BrowserLastUiUpdateUtc = [DateTime]::UtcNow
+    $script:BrowserLastDataPersistUtc = [DateTime]::UtcNow
     $updatedText.Text = '浏览器同步 ' + (Get-Date).ToString('HH:mm:ss')
     $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#8694A0')
 }
@@ -1872,7 +1948,24 @@ function Complete-LanZBrowserResponses {
                 if ($null -ne $script:BrowserCaptureState -and $script:BrowserCaptureState.AtMonitorPage) {
                     $script:BrowserCaptureState.MonitorPanelReady = $true
                 }
-                Update-LanZFromBrowserCapture
+                # 页面约每 3 秒返回一次状态包，但图表设计粒度是 10 秒。
+                # 每个响应都更新内存中的最新模型，UI/历史最多每 10 秒重绘
+                # 一次；手动刷新和首次捕获仍立即呈现。
+                $manualRefreshActive = $null -ne $script:BrowserCaptureState -and [bool]$script:BrowserCaptureState.ManualRefreshActive
+                $uiRefreshDue = $script:BrowserLastUiUpdateUtc -eq [DateTime]::MinValue -or
+                    ([DateTime]::UtcNow - $script:BrowserLastUiUpdateUtc).TotalSeconds -ge $script:BrowserUiRefreshSeconds
+                $windowHidden = [bool]$script:TrayWindowState.Hidden -or -not $window.IsVisible
+                if ($windowHidden) {
+                    $script:BrowserUiRefreshPending = $true
+                    $dataPersistDue = $script:BrowserLastDataPersistUtc -eq [DateTime]::MinValue -or
+                        ([DateTime]::UtcNow - $script:BrowserLastDataPersistUtc).TotalSeconds -ge $script:BrowserUiRefreshSeconds
+                    if ($dataPersistDue) {
+                        Update-LanZFromBrowserCapture -DataOnly
+                    }
+                }
+                elseif ($manualRefreshActive -or $uiRefreshDue) {
+                    Update-LanZFromBrowserCapture
+                }
                 if ($null -ne $script:BrowserCaptureState -and -not $script:BrowserCaptureState.FirstCaptureLogged) {
                     $script:BrowserCaptureState.FirstCaptureLogged = $true
                     Write-LanZBrowserDiag ('initial capture ready models={0}' -f @($script:BrowserModels).Count)
@@ -1882,7 +1975,13 @@ function Complete-LanZBrowserResponses {
                 $script:BrowserUsage = $payload.data.overview
                 $script:BrowserLastUsageUtc = [DateTime]::UtcNow
                 Save-LanZRefreshCadence -UsageUpdated
-                Update-LanZFromBrowserCapture
+                if ([bool]$script:TrayWindowState.Hidden -or -not $window.IsVisible) {
+                    $script:BrowserUiRefreshPending = $true
+                    Update-LanZFromBrowserCapture -DataOnly
+                }
+                else {
+                    Update-LanZFromBrowserCapture
+                }
             }
         }
         catch {
@@ -1936,6 +2035,15 @@ function Step-LanZBrowserCapture {
                     elseif ($requestUri.Host -eq $state.EndpointHost -and $requestUri.AbsolutePath -eq $state.UsagePath) {
                         $kind = 'usage'
                     }
+                    if ($null -ne $kind -and [int]$eventArgs.Response.StatusCode -in @(401, 403)) {
+                        # 交给 UI 计时器统一弹出登录窗，避免在 WebView2 网络事件
+                        # 回调中关闭当前监听窗口造成重入。
+                        $state.SignedOut = $true
+                        if ($state.SignedOutSinceUtc -eq [DateTime]::MinValue) {
+                            $state.SignedOutSinceUtc = [DateTime]::UtcNow
+                        }
+                        return
+                    }
                     if ($null -ne $kind -and [int]$eventArgs.Response.StatusCode -eq 200) {
                         $contentTask = $eventArgs.Response.GetContentAsync()
                         $browserResponseQueue.Add([pscustomobject]@{
@@ -1958,11 +2066,18 @@ function Step-LanZBrowserCapture {
                     if ($eventArgs.IsSuccess) {
                         $sourceUri = [Uri][string]$sender.CoreWebView2.Source
                         if ($sourceUri.Scheme -in @('http', 'https')) {
-                            $state.SignedOut = $sourceUri.Host -ne $state.EndpointHost
+                            # 过期会话既可能跳转到独立 SSO 域，也可能停在服务域
+                            # 自身的 /login 页面；两种情况都应进入重新验证流程。
+                            $isLoginPath = $sourceUri.AbsolutePath -match '^/(login|auth)(/|$)'
+                            $state.SignedOut = $sourceUri.Host -ne $state.EndpointHost -or $isLoginPath
                             if ($state.SignedOut) {
+                                if ($state.SignedOutSinceUtc -eq [DateTime]::MinValue) {
+                                    $state.SignedOutSinceUtc = [DateTime]::UtcNow
+                                }
                                 Write-LanZBrowserDiag ('navigation left service path={0}' -f $sourceUri.AbsolutePath)
                             }
                             else {
+                                $state.SignedOutSinceUtc = [DateTime]::MinValue
                                 $state.AtMonitorPage = $sourceUri.AbsolutePath -eq ([Uri]$state.MonitorUri).AbsolutePath
                                 if ($state.AtMonitorPage) {
                                     $state.MonitorPanelReady = $false
@@ -1994,6 +2109,27 @@ function Step-LanZBrowserCapture {
             $core.Navigate($state.NavigationUri)
             Write-LanZBrowserDiag ('navigate dashboard path={0}' -f ([Uri]$state.NavigationUri).AbsolutePath)
             $state.Stage = 'bootstrap'
+            return
+        }
+
+        if ($state.SignedOut -and
+            $state.SignedOutSinceUtc -ne [DateTime]::MinValue -and
+            ([DateTime]::UtcNow - $state.SignedOutSinceUtc).TotalMilliseconds -ge 750) {
+            if (-not $script:LoginWindowOpen -and
+                -not $script:SuppressAutoLogin -and
+                -not [bool]$state.LoginPromptQueued) {
+                $state.LoginPromptQueued = $true
+                $updatedText.Text = '会话已过期，正在打开登录窗口…'
+                $updatedText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#E6A23C')
+                Write-LanZBrowserDiag 'session expired; login prompt queued'
+                # 延迟到当前捕获 Tick 结束后再关闭隐藏 WebView2 并打开登录窗，
+                # 防止 NavigationCompleted/响应事件回调与 Dispose 相互重入。
+                [void]$window.Dispatcher.BeginInvoke([Action]{
+                    if (-not $script:LoginWindowOpen -and -not $script:SuppressAutoLogin) {
+                        Show-LanZLogin
+                    }
+                })
+            }
             return
         }
 
@@ -2042,7 +2178,7 @@ function Step-LanZBrowserCapture {
                     }
                 }
             }
-            if ($state.SignedOut -or -not $state.AtMonitorPage) {
+            if (-not $state.AtMonitorPage) {
                 return
             }
 
@@ -2228,6 +2364,8 @@ function Start-LanZBrowserCapture {
             ResponseHandler = $null
             NavigationHandler = $null
             SignedOut = $false
+            SignedOutSinceUtc = [DateTime]::MinValue
+            LoginPromptQueued = $false
             AtMonitorPage = $false
             MonitorPanelReady = $false
             PanelScriptTask = $null
@@ -2245,6 +2383,9 @@ function Start-LanZBrowserCapture {
         }
         $script:BrowserLastModelsUtc = [DateTime]::MinValue
         $script:BrowserLastUsageUtc = [DateTime]::MinValue
+        $script:BrowserLastUiUpdateUtc = [DateTime]::MinValue
+        $script:BrowserLastDataPersistUtc = [DateTime]::MinValue
+        $script:BrowserUiRefreshPending = $false
         $captureWindow.Show()
         $script:BrowserCaptureState.EnsureTask = $captureView.EnsureCoreWebView2Async()
         $script:BrowserCaptureTimer.Start()
@@ -2275,6 +2416,8 @@ function Request-LanZBrowserFullRefresh {
     $state.ManualRefreshDeadlineUtc = [DateTime]::UtcNow.AddSeconds(25)
     $state.Stage = 'bootstrap'
     $state.SignedOut = $false
+    $state.SignedOutSinceUtc = [DateTime]::MinValue
+    $state.LoginPromptQueued = $false
     $state.AtMonitorPage = $false
     $state.MonitorPanelReady = $false
     $state.PanelScriptTask = $null
@@ -2308,6 +2451,7 @@ function Write-LanZBrowserDiag {
 function Show-LanZMainWindow {
     param([switch]$Pin)
 
+    $script:TrayWindowState.Hidden = $false
     if ($Pin) {
         $pinToggle.IsChecked = $true
     }
@@ -2316,12 +2460,27 @@ function Show-LanZMainWindow {
     }
     $window.Show()
     [void]$window.Activate()
+    [void]$window.Focus()
     $window.Topmost = [bool]$pinToggle.IsChecked
+    if ($script:BrowserUiRefreshPending -and $null -ne $script:ResumeUiTimer) {
+        # 先让窗口真正显示，再在下一次 UI 调度中重建一次最新图表，
+        # 避免恢复动作本身被隐藏期间积压的布局工作阻塞。
+        $script:ResumeUiTimer.Stop()
+        $script:ResumeUiTimer.Start()
+    }
+    Write-LanZBrowserDiag 'main window shown from tray'
 }
 
 function Hide-LanZMainWindow {
+    # IsVisible 在 Hide/Closing 与 WinForms 托盘回调交错时可能短暂保留旧值。
+    # 先记录明确状态，让下一次托盘双击永远以用户最后一次操作为准。
+    $script:TrayWindowState.Hidden = $true
+    if ($null -ne $script:ResumeUiTimer) {
+        $script:ResumeUiTimer.Stop()
+    }
     $settingsPopup.IsOpen = $false
     $window.Hide()
+    Write-LanZBrowserDiag 'main window hidden to tray'
 }
 
 function Request-LanZExit {
@@ -2394,10 +2553,16 @@ function Initialize-LanZTrayIcon {
     $script:TrayExitHandler = [EventHandler]$exitHandlerBlock
     $exitMenu.Add_Click($script:TrayExitHandler)
 
+    $trayWindowState = $script:TrayWindowState
     $doubleClickHandlerBlock = {
         param($sender, $eventArgs)
+        $clickUtc = [DateTime]::UtcNow
+        if (($clickUtc - $trayWindowState.LastDoubleClickUtc).TotalMilliseconds -lt 350) {
+            return
+        }
+        $trayWindowState.LastDoubleClickUtc = $clickUtc
         [void]$window.Dispatcher.BeginInvoke([Action]{
-            if ($window.IsVisible) {
+            if (-not $trayWindowState.Hidden -and $window.IsVisible) {
                 Hide-LanZMainWindow
             }
             else {
@@ -3650,8 +3815,17 @@ $updatePollTimer = [Windows.Threading.DispatcherTimer]::new()
 $updatePollTimer.Interval = [TimeSpan]::FromMilliseconds(150)
 $updatePollTimer.Add_Tick({ Complete-LanZUpdateOperation })
 $script:BrowserCaptureTimer = [Windows.Threading.DispatcherTimer]::new()
-$script:BrowserCaptureTimer.Interval = [TimeSpan]::FromMilliseconds(120)
+$script:BrowserCaptureTimer.Interval = [TimeSpan]::FromMilliseconds(500)
 $script:BrowserCaptureTimer.Add_Tick({ Step-LanZBrowserCapture })
+$script:ResumeUiTimer = [Windows.Threading.DispatcherTimer]::new()
+$script:ResumeUiTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$script:ResumeUiTimer.Add_Tick({
+    $script:ResumeUiTimer.Stop()
+    if ($window.IsVisible -and $script:BrowserUiRefreshPending) {
+        $script:BrowserUiRefreshPending = $false
+        Update-LanZFromBrowserCapture
+    }
+})
 $startupTimer = [Windows.Threading.DispatcherTimer]::new()
 $startupTimer.Interval = [TimeSpan]::FromSeconds(5)
 $startupTimer.Add_Tick({
@@ -3886,6 +4060,7 @@ $window.Add_Closed({
     $timer.Stop()
     $refreshPollTimer.Stop()
     $updatePollTimer.Stop()
+    $script:ResumeUiTimer.Stop()
     Stop-LanZBrowserCapture
     Dispose-LanZTrayIcon
     if ($null -ne $script:RefreshWorker) {

@@ -37,7 +37,7 @@
 
 ### Windows EXE 版
 
-1. 从 GitHub Releases 下载带版本号的单文件 EXE，例如 `LanZ-Monitor-v1.4.2.exe`。
+1. 从 GitHub Releases 下载带版本号的单文件 EXE，例如 `LanZ-Monitor-v1.4.3.exe`。
 2. 运行 EXE。首次运行会直接打开 LanZ 登录页面；完成登录后，程序自动取得会话并开始监控。
 3. 以后可直接运行同一个 EXE。重新登录、切换凭据和检查更新都位于齿轮菜单。
 
